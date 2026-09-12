@@ -8,6 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.models import SearchResponse
 from api.search import execute_search
 from api.cache import CacheClient
+from api.rag.config import RagConfig
+from api.rag.routes import create_router
 
 
 # Global references set during lifespan (or left None for testing)
@@ -41,6 +43,7 @@ async def lifespan(app: FastAPI):
 def create_app(use_lifespan: bool = False) -> FastAPI:
     """Create the FastAPI app. use_lifespan=False for testing."""
     app = FastAPI(title="Podcast Search", lifespan=lifespan if use_lifespan else None)
+    app.include_router(create_router(RagConfig.from_env()))
 
     app.add_middleware(
         CORSMiddleware,
