@@ -1,0 +1,16 @@
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+.env
+.pytest_cache/
+dist/
+*.egg-info/
+
+# Dataset (large files)
+podcasts-no-audio-13GB/
+podcasts-no-audio-13GB.zip
+*.tar.gz
+
+# Plan docs (internal)
+docs/
