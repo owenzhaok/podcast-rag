@@ -1,5 +1,53 @@
 # Podcast Search
 
+## Optional RAG evidence (Stage 2)
+
+Set `RAG_ENABLED=true` in the process environment (or use Uvicorn's
+`--env-file .env`) to enable `POST /ask` with `{"question": "..."}`. No LLM or
+embedding credentials are required for retrieval. Generation is not implemented:
+successful retrieval returns `answer: null`, full passages in `sources`,
+`retrieval_mode: "bm25"`, and `status: "generation_unavailable"`. The reason is
+`llm_not_configured` when generation settings are absent and `not_implemented`
+when present. An empty or unusable candidate set returns `insufficient_context`.
+Disabled RAG retains the Stage 1 disabled response and performs no I/O.
+
+The RAG path reuses the lexical query builder but reads `_source.clip_text`, never
+search highlights. It requests 30 candidates by default, ranks by BM25 score with
+stable provenance tie-breaks, deduplicates identical source identities, and skips
+clips overlapping at least 45% of the shorter selected clip in the same episode.
+It selects at most 6 sources with a combined 16,000 UTF-8 bytes of transcript text.
+This is a conservative token proxy, not a model token guarantee or a total HTTP
+response-size limit. Oversized clips are skipped, not truncated. Candidate,
+source, and byte limits are configurable in `.env.example`. A bounded candidate
+window may underfill the source list when repeated imports dominate results.
+
+`chunk_id` is `v1.` followed by unpadded base64url of compact UTF-8 JSON containing
+`[podcast_id, episode_id, start_ms, end_ms, sha256(exact_clip_text)]`. The content
+hash preserves whitespace; Elasticsearch document IDs and clip indexes are not
+identity inputs. Thus identical reimports collapse without modifying legacy data.
+`source_id` (`S1`, `S2`, ...) is only a response-local display label.
+
+`GET /sources/{chunk_id}` searches only the server's `RAG_SOURCE_INDEX` and checks
+the content hash before returning exact text and current PostgreSQL metadata.
+It needs no in-memory registry and survives API restarts. Invalid, unknown, stale,
+or disabled sources return 404. Elasticsearch errors/partial results return 503.
+Resolution checks up to 1,000 matching time-range records before returning 503
+rather than falsely reporting not-found. Missing or unavailable metadata retains
+identifiers/timestamps with unknown display names and `metadata_available=false`.
+Evidence responses flag `degraded=true` when metadata is unavailable.
+
+Run unit tests with `python -m pytest ingest/tests api/tests`. To also run the
+isolated real-service test in PowerShell:
+
+```powershell
+$env:RAG_INTEGRATION_TESTS = "1"
+.\.venv\Scripts\python.exe -m pytest api/tests/test_rag_integration.py -v
+```
+
+The integration test creates/deletes a unique Elasticsearch index and rolls back
+its PostgreSQL metadata transaction. Existing `/search`, Redis caching, ingestion,
+database schemas, and frontend behavior are unchanged.
+
 A full-stack search engine over the [Spotify Podcast Dataset](https://podcastsdataset.byspotify.com/) that lets users find clips from podcast episodes matching a free-text query. Results display ranked clip cards with highlighted transcript excerpts and speaker attribution.
 
 ## Architecture

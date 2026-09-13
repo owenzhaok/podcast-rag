@@ -13,6 +13,7 @@ def clean_rag_env(monkeypatch):
     for name in (
         "RAG_ENABLED", "RAG_LLM_PROVIDER", "RAG_LLM_MODEL", "RAG_LLM_API_KEY",
         "RAG_EMBEDDING_PROVIDER", "RAG_EMBEDDING_MODEL", "RAG_EMBEDDING_API_KEY",
+        "RAG_SOURCE_INDEX", "RAG_CANDIDATE_LIMIT", "RAG_MAX_SOURCES", "RAG_CONTEXT_MAX_BYTES",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -23,6 +24,7 @@ async def test_startup_without_optional_credentials(monkeypatch, value):
     if value is not None:
         monkeypatch.setenv("RAG_ENABLED", value)
     es, pool, redis = AsyncMock(), AsyncMock(), AsyncMock()
+    es.search.return_value = {"hits": {"hits": []}}
     # Restore existing globals after exercising the real production lifespan.
     for name in ("_es_client", "_db_pool", "_cache_client"):
         monkeypatch.setattr(main, name, None)
@@ -39,9 +41,12 @@ async def test_startup_without_optional_credentials(monkeypatch, value):
                 assert health.json() == {"status": "ok"}
                 response = await client.post("/ask", json={"question": "What is discussed?"})
                 assert response.status_code == 200
-                expected = "generation_unavailable" if value == "true" else "disabled"
+                expected = "insufficient_context" if value == "true" else "disabled"
                 assert response.json()["status"] == expected
-            es.search.assert_not_called()
+            if value == "true":
+                es.search.assert_awaited_once()
+            else:
+                es.search.assert_not_called()
             pool.fetchrow.assert_not_called()
             redis.get.assert_not_called()
             redis.set.assert_not_called()
@@ -52,8 +57,6 @@ async def test_startup_without_optional_credentials(monkeypatch, value):
 
 @pytest.mark.parametrize("enabled,configured,reason", [
     ("false", False, "rag_disabled"),
-    ("true", False, "llm_not_configured"),
-    ("true", True, "not_implemented"),
 ])
 @pytest.mark.asyncio
 async def test_ask_unavailable_contract_and_no_io(monkeypatch, enabled, configured, reason):
