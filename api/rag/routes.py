@@ -1,4 +1,4 @@
-"""Optional grounded generation and read-only source routes; no RAG caching."""
+"""Always retrieve current evidence before optional cached generation."""
 
 from time import perf_counter
 from fastapi import APIRouter, HTTPException, Depends
@@ -9,7 +9,7 @@ from api.rag.groq import get_generation_provider
 from api.rag.generation import generate_answer
 
 
-def create_router(config: RagConfig, get_clients=lambda: (None, None)) -> APIRouter:
+def create_router(config: RagConfig, get_clients=lambda: (None, None), get_redis=lambda: None) -> APIRouter:
     router = APIRouter()
 
     @router.post("/ask", response_model=AskResponse)
@@ -24,7 +24,7 @@ def create_router(config: RagConfig, get_clients=lambda: (None, None)) -> APIRou
             sources = await retrieve(request.question, es, pool, config)
         except RetrievalUnavailable:
             raise HTTPException(status_code=503, detail="retrieval_unavailable") from None
-        response = await generate_answer(request.question, sources, config, provider)
+        response = await generate_answer(request.question, sources, config, provider, get_redis())
         response.took_ms = int((perf_counter() - started) * 1000)
         return response
 

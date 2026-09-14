@@ -3,6 +3,7 @@
 import asyncio
 
 from api.rag.citations import validate_output
+from api.rag.cache import GenerationCache, generation_key
 from api.rag.config import RagConfig
 from api.rag.llm import GenerationRequest, LLMProvider, InvalidGeneration, ProviderFailure
 from api.rag.models import Answer, AskResponse, RagSource
@@ -10,7 +11,7 @@ from api.rag.prompt import SYSTEM, build_context
 
 
 async def generate_answer(question: str, sources: list[RagSource], config: RagConfig,
-                          provider: LLMProvider | None) -> AskResponse:
+                          provider: LLMProvider | None, redis=None) -> AskResponse:
     response = AskResponse(question=question, sources=sources, retrieval_mode="bm25",
                            status="insufficient_context", reason="no_usable_evidence",
                            degraded=any(not s.metadata_available for s in sources))
@@ -27,11 +28,19 @@ async def generate_answer(question: str, sources: list[RagSource], config: RagCo
         response.degraded = True
         return response
     try:
-        raw = await asyncio.wait_for(provider.generate(GenerationRequest(
+        request = GenerationRequest(
             system=SYSTEM, user=context.user, model=config.llm_model,
             max_output_tokens=config.max_output_tokens, timeout_seconds=config.llm_timeout_seconds,
-        )), timeout=config.llm_timeout_seconds)
-        output = validate_output(raw, context.source_ids)
+        )
+        cache = GenerationCache(redis, config.answer_cache_ttl_seconds)
+        key = generation_key(request, config.llm_provider)
+        output = await cache.get(key, context.source_ids)
+        if output is not None:
+            response.cached = True
+        else:
+            raw = await asyncio.wait_for(provider.generate(request), timeout=config.llm_timeout_seconds)
+            output = validate_output(raw, context.source_ids)
+            await cache.set(key, output)
         if output.status == "insufficient_context":
             response.reason = "model_abstained"
             return response

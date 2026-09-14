@@ -8,7 +8,9 @@ import pytest
 @pytest.fixture(autouse=True)
 def isolate_llm(monkeypatch):
     for name in list(os.environ):
-        if name.startswith("RAG_LLM_") or name in ("RAG_CONTEXT_MAX_TOKENS", "RAG_MAX_OUTPUT_TOKENS"):
+        if name.startswith("RAG_LLM_") or name in (
+            "RAG_CONTEXT_MAX_TOKENS", "RAG_MAX_OUTPUT_TOKENS", "RAG_ANSWER_CACHE_TTL_SECONDS",
+        ):
             monkeypatch.delenv(name, raising=False)
 
     attempts = []

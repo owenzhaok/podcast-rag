@@ -18,6 +18,15 @@ class RagConfig:
     context_max_tokens: int = 8000
     max_output_tokens: int = 800
     llm_timeout_seconds: int = 20
+    answer_cache_ttl_seconds: int = 900
+
+    @staticmethod
+    def _cache_ttl() -> int:
+        try:
+            value = int(os.environ.get("RAG_ANSWER_CACHE_TTL_SECONDS", "900"))
+            return value if 0 <= value <= 2147483647 else 900
+        except ValueError:
+            return 900
 
     @staticmethod
     def _bounded_int(name: str, default: int, maximum: int) -> int:
@@ -51,4 +60,5 @@ class RagConfig:
             context_max_tokens=cls._bounded_int("RAG_CONTEXT_MAX_TOKENS", 8000, 128000),
             max_output_tokens=cls._bounded_int("RAG_MAX_OUTPUT_TOKENS", 800, 4096),
             llm_timeout_seconds=cls._bounded_int("RAG_LLM_TIMEOUT_SECONDS", 20, 120),
+            answer_cache_ttl_seconds=cls._cache_ttl(),
         )

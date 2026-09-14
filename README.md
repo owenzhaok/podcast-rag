@@ -1,5 +1,30 @@
 # Podcast Search
 
+## RAG generation cache (Stage 5)
+
+`RAG_ANSWER_CACHE_TTL_SECONDS=900` enables a 15-minute generation cache using the
+existing Redis connection. Set `0` to disable it; restart the API after changes.
+BM25 retrieval, metadata enrichment, and context selection still run on every
+`/ask`. Only validated structured answers and model abstentions are cached, never
+the complete response or old source metadata. `cached=true` means generation was
+loaded from this cache and revalidated against the current context's source IDs.
+
+Keys use `rag:answer:v1:<sha256>`, separate from the unchanged search cache and its
+TTL. The hash covers the actual system/user prompts (including evidence order),
+provider, model, output limit, timeout, validation schema, and generation version.
+Raw questions, transcripts, and credentials are not placed in keys. The payload
+contains only `status` and `paragraphs`; Redis therefore stores generated text.
+Provider wire-schema/fixed-setting changes must bump `GENERATION_VERSION`.
+
+Failures, invalid outputs, disabled/unconfigured RAG, missing evidence, and context
+budget failures are not cached. Corrupt entries are misses and may be overwritten
+by a valid generation; otherwise they expire. Redis GET/SET errors fail open, with
+a one-second bound per cache operation, and never expose Redis diagnostics.
+Hits do not refresh TTL. Concurrent misses may each generate; there is no locking
+or request coalescing in this stage. Equivalent means identical effective prompts,
+not semantic similarity. API keys are excluded from cache identity, so key rotation
+does not invalidate otherwise identical generation.
+
 ## Optional RAG answers (Stage 3)
 
 Set `RAG_ENABLED=true` in the process environment (or use Uvicorn's
