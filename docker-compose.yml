@@ -8,7 +8,7 @@ services:
     ports:
       - "9200:9200"
     volumes:
-      - esdata:/var/lib/elasticsearch/data
+      - esdata:/usr/share/elasticsearch/data
 
   postgres:
     image: postgres:16
