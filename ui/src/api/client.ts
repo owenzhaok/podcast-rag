@@ -1,9 +1,20 @@
-import { SearchResponse } from '../types';
+import { SearchResponse, AskResponse } from '../types';
 
 export class SearchError extends Error {
   constructor(message: string, public status: number) {
     super(message);
   }
+}
+
+export async function ask(question: string, signal?: AbortSignal): Promise<AskResponse> {
+  const resp = await fetch('/ask', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question }),
+    signal,
+  });
+  if (!resp.ok) throw new Error('Question answering request failed');
+  return resp.json();
 }
 
 export async function search(

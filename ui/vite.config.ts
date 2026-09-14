@@ -11,6 +11,7 @@ export default defineConfig({
   server: {
     proxy: {
       '/search': 'http://localhost:8000',
+      '/ask': 'http://localhost:8000',
       '/health': 'http://localhost:8000',
     },
   },
