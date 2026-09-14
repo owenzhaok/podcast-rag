@@ -1,5 +1,140 @@
 # Podcast Search
 
+## Optional vector preparation (Stage 6)
+
+Stage 6 is offline preparation only. `/search` is unchanged; `/ask` still uses
+BM25, the Stage 5 generation cache, and Groq. No vector configuration is loaded by
+API startup and no vector state is added to the active generation-cache identity.
+Hybrid retrieval is reserved for Stage 7.
+
+The companion index defaults to `RAG_VECTOR_INDEX=podcast_rag_v1`. It uses a strict
+mapping with an indexed float `dense_vector`, explicit dimensions, cosine
+similarity, and HNSW. It stores the exact Stage 2 `chunk_id`, show/episode IDs,
+timestamps, exact `chunk_text`, content hash, speakers, source index, provider,
+model, revision, and chunking version. Legacy Elasticsearch document IDs are not
+needed: duplicates share the same stable provenance. The vector document `_id`
+is SHA-256 of the existing Stage 2 `chunk_id` (to respect Elasticsearch's 512-byte
+ID limit); the original chunk ID remains available in the document.
+
+`RAG_EMBEDDING_PROVIDER`, `RAG_EMBEDDING_MODEL`, and `RAG_EMBEDDING_DIMENSIONS` must
+be explicitly configured for the tool. Batch size defaults to 32 (1–200), revision
+to `v1`, and dimensions must be 1–4096. Only the opt-in `fake` provider is currently
+implemented. Its deterministic normalized vectors test plumbing, **not semantic
+similarity**. A real embedding provider/model and its matching dimensions remain
+a deployment decision; add an adapter implementing `EmbeddingProvider.embed`
+before using real embeddings. No paid provider, credentials, SDK, or dependency
+has been added. Never put keys in model/revision identifiers or commit credentials.
+
+Commands use the process environment and existing `ES_HOST`/`RAG_SOURCE_INDEX`:
+
+```powershell
+.\.venv\Scripts\python.exe -B -m api.rag.backfill create
+.\.venv\Scripts\python.exe -B -m api.rag.backfill check
+.\.venv\Scripts\python.exe -B -m api.rag.backfill backfill --limit 10
+```
+
+Creation is explicit and idempotent. Backfill requires an existing compatible
+index and an explicit positive scan limit; it never creates/recreates indexes.
+Concrete index names only: aliases, wildcard targets, and equal source/vector
+names are rejected. Incompatible mappings/dimensions stop safely. Do not create
+fake vectors in a companion index intended for real semantic retrieval.
+
+Backfill scans source clips in bounded batches using a scroll snapshot, validates
+whole embedding batches before writing, and upserts deterministic IDs. It checks
+existing documents in real time, skipping matching content/provenance and
+provider/model/revision/chunking version with valid vectors. Progress logs contain
+only scanned/written/skipped counts. Source clips over 256 KiB or invalid clips
+stop the run. Previously completed batches survive a failure; a bulk-write failure
+can leave part of its batch complete, and rerunning safely fills the remainder.
+No global in-memory deduplication set or automatic startup work is used.
+
+Changed exact transcript content has a new identity and creates a new document;
+old identities are retained, never silently deleted. Model/revision changes with
+the same dimensions re-embed existing identities. Dimension changes require a
+new versioned index. Run one backfill per target at a time; after interruption or
+a model change, finish a full intended scan before using that index in future
+retrieval. A limited rerun begins from the start and is not a persistent cursor.
+
+### Safe manual Stage 6 validation (PowerShell)
+
+Run from the repository root with existing Docker services running. This creates
+only two uniquely named tiny test indexes; it does not write `podcast_clips`, touch
+backups, or delete any data. It intentionally uses a test companion name rather
+than populating the production default with fake vectors.
+
+```powershell
+$es = 'http://localhost:9200'
+$originalCount = (Invoke-RestMethod "$es/podcast_clips/_count").count
+$suffix = [guid]::NewGuid().ToString('N')
+$env:RAG_SOURCE_INDEX = "rag-stage6-source-$suffix"
+$env:RAG_VECTOR_INDEX = "podcast_rag_v1_smoke_$suffix"
+$env:RAG_EMBEDDING_PROVIDER = 'fake'
+$env:RAG_EMBEDDING_MODEL = 'fake-smoke'
+$env:RAG_EMBEDDING_DIMENSIONS = '8'
+$env:RAG_EMBEDDING_BATCH_SIZE = '2'
+$env:RAG_EMBEDDING_REVISION = 'v1'
+$sourceUrl = "$es/$env:RAG_SOURCE_INDEX"
+$vectorUrl = "$es/$env:RAG_VECTOR_INDEX"
+Invoke-RestMethod -Method Put -Uri $sourceUrl -ContentType 'application/json' `
+  -Body '{"settings":{"number_of_shards":1,"number_of_replicas":0}}'
+$doc = @{podcast_id='demo-show'; episode_id='demo-episode'; clip_index=0;
+  clip_start_ms=0; clip_end_ms=120000; speakers=@(1);
+  clip_text='Machine learning identifies patterns in research.'} | ConvertTo-Json
+Invoke-RestMethod -Method Put -Uri "$sourceUrl/_doc/one?refresh=true" `
+  -ContentType 'application/json' -Body $doc
+Invoke-RestMethod -Method Put -Uri "$sourceUrl/_doc/duplicate?refresh=true" `
+  -ContentType 'application/json' -Body $doc
+$beforeSource = Invoke-RestMethod "$sourceUrl/_search?size=10"
+.\.venv\Scripts\python.exe -B -m api.rag.backfill create
+.\.venv\Scripts\python.exe -B -m api.rag.backfill check
+.\.venv\Scripts\python.exe -B -m api.rag.backfill backfill --limit 10
+Invoke-RestMethod -Method Post "$vectorUrl/_refresh"
+$first = Invoke-RestMethod "$vectorUrl/_search?size=10"
+.\.venv\Scripts\python.exe -B -m api.rag.backfill backfill --limit 10
+Invoke-RestMethod -Method Post "$vectorUrl/_refresh"
+$second = Invoke-RestMethod "$vectorUrl/_search?size=10"
+if ($first.hits.total.value -ne 1 -or $second.hits.total.value -ne 1) { throw 'Count mismatch' }
+if ($first.hits.hits[0]._id -ne $second.hits.hits[0]._id) { throw 'ID changed' }
+if ($second.hits.hits[0]._source.embedding.Count -ne 8) { throw 'Wrong dimension' }
+Invoke-RestMethod "$vectorUrl/_mapping" | ConvertTo-Json -Depth 15
+$afterSource = Invoke-RestMethod "$sourceUrl/_search?size=10"
+$before = $beforeSource.hits.hits | Sort-Object _id | ConvertTo-Json -Depth 15 -Compress
+$after = $afterSource.hits.hits | Sort-Object _id | ConvertTo-Json -Depth 15 -Compress
+if ($before -ne $after) { throw 'Test source changed' }
+if ((Invoke-RestMethod "$es/podcast_clips/_count").count -ne $originalCount) { throw 'Corpus count changed' }
+# Leave the tiny test indexes intact for inspection; no deletion commands.
+# Reset source selection before starting any API in this shell.
+$env:RAG_SOURCE_INDEX = 'podcast_clips'
+```
+
+Expected backfill summaries: first `written=1`, second `written=0`, both
+`scanned=2`. To verify BM25 without a Groq call, start an evidence-only API on a
+separate port (keep existing application processes unchanged):
+
+```powershell
+$env:RAG_ENABLED = 'true'
+$env:RAG_LLM_PROVIDER = ''
+.\.venv\Scripts\python.exe -B -m uvicorn api.main:app --host 127.0.0.1 --port 8001
+```
+
+In another PowerShell window:
+
+```powershell
+$result = Invoke-RestMethod -Method Post 'http://localhost:8001/ask' `
+  -ContentType 'application/json' -Body '{"question":"machine learning"}'
+$result | Select-Object status, reason, retrieval_mode
+if ($result.retrieval_mode -ne 'bm25') { throw 'Unexpected retrieval mode' }
+```
+
+Stop the temporary API with Ctrl+C. The opt-in automated integration test uses
+temporary indices and fake vectors, checks kNN queryability and source integrity,
+and cleans up only its own unique indices:
+
+```powershell
+$env:RAG_INTEGRATION_TESTS = '1'
+.\.venv\Scripts\python.exe -B -m pytest api/tests/test_vector_preparation.py -q
+```
+
 ## RAG generation cache (Stage 5)
 
 `RAG_ANSWER_CACHE_TTL_SECONDS=900` enables a 15-minute generation cache using the
