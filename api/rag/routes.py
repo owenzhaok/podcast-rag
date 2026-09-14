@@ -1,17 +1,19 @@
-"""Evidence-only routes; no generation or RAG caching."""
+"""Optional grounded generation and read-only source routes; no RAG caching."""
 
 from time import perf_counter
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from api.rag.config import RagConfig
 from api.rag.models import AskRequest, AskResponse, RagSource
 from api.rag.retrieval import retrieve, resolve, RetrievalUnavailable
+from api.rag.groq import get_generation_provider
+from api.rag.generation import generate_answer
 
 
 def create_router(config: RagConfig, get_clients=lambda: (None, None)) -> APIRouter:
     router = APIRouter()
 
     @router.post("/ask", response_model=AskResponse)
-    async def ask(request: AskRequest):
+    async def ask(request: AskRequest, provider=Depends(get_generation_provider)):
         if not config.enabled:
             return AskResponse(
                 question=request.question, status="disabled", reason="rag_disabled",
@@ -22,15 +24,9 @@ def create_router(config: RagConfig, get_clients=lambda: (None, None)) -> APIRou
             sources = await retrieve(request.question, es, pool, config)
         except RetrievalUnavailable:
             raise HTTPException(status_code=503, detail="retrieval_unavailable") from None
-        return AskResponse(
-            question=request.question,
-            status="generation_unavailable" if sources else "insufficient_context",
-            reason=("not_implemented" if config.llm_configured else "llm_not_configured")
-            if sources else "no_usable_evidence",
-            sources=sources, retrieval_mode="bm25",
-            degraded=any(not source.metadata_available for source in sources),
-            took_ms=int((perf_counter() - started) * 1000),
-        )
+        response = await generate_answer(request.question, sources, config, provider)
+        response.took_ms = int((perf_counter() - started) * 1000)
+        return response
 
     @router.get("/sources/{chunk_id}", response_model=RagSource)
     async def source(chunk_id: str):

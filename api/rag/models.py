@@ -1,7 +1,24 @@
-"""Evidence-only question answering contracts; generation remains unavailable."""
+"""Question answering, validated paragraphs, and evidence response contracts."""
 
 from typing import Literal
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class AnswerParagraph(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+    text: str = Field(min_length=1, max_length=4000)
+    source_ids: list[str] = Field(min_length=1, max_length=20)
+
+    @field_validator("text")
+    @classmethod
+    def nonblank_text(cls, value):
+        if not value.strip():
+            raise ValueError("Empty paragraph")
+        return value
+
+
+class Answer(BaseModel):
+    paragraphs: list[AnswerParagraph]
 
 
 class AskRequest(BaseModel):
@@ -31,9 +48,9 @@ class RagSource(BaseModel):
 
 class AskResponse(BaseModel):
     question: str
-    status: Literal["disabled", "generation_unavailable", "insufficient_context"]
-    reason: Literal["rag_disabled", "llm_not_configured", "not_implemented", "no_usable_evidence"]
-    answer: None = None
+    status: Literal["disabled", "generation_unavailable", "insufficient_context", "answered", "invalid_generation"]
+    reason: str | None = None
+    answer: Answer | None = None
     sources: list[RagSource] = Field(default_factory=list)
     retrieval_mode: Literal["bm25"] | None = None
     degraded: bool = False

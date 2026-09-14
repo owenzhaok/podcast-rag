@@ -13,6 +13,11 @@ class RagConfig:
     candidate_limit: int = 30
     max_sources: int = 6
     context_max_bytes: int = 16000
+    llm_provider: str = ""
+    llm_model: str = ""
+    context_max_tokens: int = 8000
+    max_output_tokens: int = 800
+    llm_timeout_seconds: int = 20
 
     @staticmethod
     def _bounded_int(name: str, default: int, maximum: int) -> int:
@@ -41,4 +46,9 @@ class RagConfig:
             candidate_limit=cls._bounded_int("RAG_CANDIDATE_LIMIT", 30, 200),
             max_sources=cls._bounded_int("RAG_MAX_SOURCES", 6, 20),
             context_max_bytes=cls._bounded_int("RAG_CONTEXT_MAX_BYTES", 16000, 64000),
+            llm_provider=os.environ.get("RAG_LLM_PROVIDER", "").strip().lower(),
+            llm_model=os.environ.get("RAG_LLM_MODEL", "").strip(),
+            context_max_tokens=cls._bounded_int("RAG_CONTEXT_MAX_TOKENS", 8000, 128000),
+            max_output_tokens=cls._bounded_int("RAG_MAX_OUTPUT_TOKENS", 800, 4096),
+            llm_timeout_seconds=cls._bounded_int("RAG_LLM_TIMEOUT_SECONDS", 20, 120),
         )

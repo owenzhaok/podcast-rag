@@ -43,7 +43,8 @@ async def lifespan(app: FastAPI):
 def create_app(use_lifespan: bool = False) -> FastAPI:
     """Create the FastAPI app. use_lifespan=False for testing."""
     app = FastAPI(title="Podcast Search", lifespan=lifespan if use_lifespan else None)
-    app.include_router(create_router(RagConfig.from_env(), lambda: (_es_client, _db_pool)))
+    app.state.rag_config = RagConfig.from_env()
+    app.include_router(create_router(app.state.rag_config, lambda: (_es_client, _db_pool)))
 
     app.add_middleware(
         CORSMiddleware,

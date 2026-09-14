@@ -126,8 +126,10 @@ def test_config_presence_and_secret_not_retained(monkeypatch):
     monkeypatch.setenv("RAG_LLM_PROVIDER", "test-provider")
     monkeypatch.setenv("RAG_LLM_MODEL", "test-model")
     monkeypatch.setenv("RAG_LLM_API_KEY", " ")
-    assert RagConfig.from_env() == RagConfig(enabled=True, llm_configured=False)
+    assert RagConfig.from_env() == RagConfig(enabled=True, llm_configured=False,
+                                           llm_provider="test-provider", llm_model="test-model")
     monkeypatch.setenv("RAG_LLM_API_KEY", "test-placeholder")
     config = RagConfig.from_env()
-    assert config == RagConfig(enabled=True, llm_configured=True)
+    assert config == RagConfig(enabled=True, llm_configured=True,
+                               llm_provider="test-provider", llm_model="test-model")
     assert "test-placeholder" not in repr(config)

@@ -207,14 +207,14 @@ async def test_enabled_ask_without_keys_and_source_route(enabled_app):
 
 
 @pytest.mark.asyncio
-async def test_configured_generation_still_not_implemented(enabled_app, monkeypatch):
+async def test_unsupported_provider_preserves_evidence(enabled_app, monkeypatch):
     _, es, pool, _ = enabled_app
     for name in ("RAG_LLM_API_KEY", "RAG_LLM_PROVIDER", "RAG_LLM_MODEL"):
         monkeypatch.setenv(name, "test-placeholder")
     app = main.create_app()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         body = (await client.post("/ask", json={"question": "question"})).json()
-    assert body["reason"] == "not_implemented" and body["answer"] is None
+    assert body["reason"] == "unsupported_provider" and body["answer"] is None
     assert body["sources"] and "test-placeholder" not in str(body)
 
 

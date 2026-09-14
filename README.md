@@ -1,15 +1,78 @@
 # Podcast Search
 
-## Optional RAG evidence (Stage 2)
+## Optional RAG answers (Stage 3)
 
 Set `RAG_ENABLED=true` in the process environment (or use Uvicorn's
 `--env-file .env`) to enable `POST /ask` with `{"question": "..."}`. No LLM or
-embedding credentials are required for retrieval. Generation is not implemented:
-successful retrieval returns `answer: null`, full passages in `sources`,
-`retrieval_mode: "bm25"`, and `status: "generation_unavailable"`. The reason is
-`llm_not_configured` when generation settings are absent and `not_implemented`
-when present. An empty or unusable candidate set returns `insufficient_context`.
+embedding credentials are required for retrieval. Without generation settings,
+retrieval returns `answer: null`, full passages in `sources`,
+`retrieval_mode: "bm25"`, and `status: "generation_unavailable"` with reason
+`llm_not_configured`. An unsupported provider returns `unsupported_provider`.
+An empty or unusable candidate set returns `insufficient_context`.
 Disabled RAG retains the Stage 1 disabled response and performs no I/O.
+
+For optional live generation, configure only server-side environment variables:
+
+```text
+RAG_ENABLED=true
+RAG_LLM_PROVIDER=groq
+RAG_LLM_MODEL=openai/gpt-oss-20b
+RAG_LLM_API_KEY=
+RAG_CONTEXT_MAX_TOKENS=8000
+RAG_MAX_OUTPUT_TOKENS=1600
+RAG_LLM_TIMEOUT_SECONDS=20
+```
+
+Supply the key privately in your local environment. These are live-validated
+starting values for this project, not universal optimal values. The model is
+selected solely through `RAG_LLM_MODEL`; application logic has no hard-coded model.
+Live validation returned a grounded answer with validated citations using these settings.
+
+No default model or SDK is supplied. The adapter uses the existing async HTTPX
+client and Groq's `POST https://api.groq.com/openai/v1/chat/completions`, with
+`response_format.type=json_schema`, `json_schema.strict=true`, and
+`max_completion_tokens`. Select a model supporting strict Structured Outputs.
+The closed schema requires `status` and `paragraphs`; each paragraph requires
+`text` and `source_ids`. Application validation remains authoritative for citation
+membership and semantic status consistency. See [Groq Structured Outputs](https://console.groq.com/docs/structured-outputs).
+Provider credentials are read only from `RAG_LLM_API_KEY`, never put in prompts,
+serialized config, error messages, or frontend responses. Clients close after each
+request; redirects, ambient HTTP proxies, streaming, and automatic retries are off.
+
+System instructions require evidence-only answers, paragraph-level source IDs,
+abstention when unsupported, and ignoring instructions in transcript text. The
+user message contains JSON-encoded question and `TRANSCRIPT_EVIDENCE` data.
+Successful responses contain `status: "answered"` and
+`answer: {"paragraphs":[{"text":"...","source_ids":["S1"]}]}`. Every paragraph
+must be nonblank and cite supplied evidence; unknown IDs, extra fields, duplicate
+JSON keys, wrong types, malformed JSON, and missing citations reject the entire
+answer as `invalid_generation`. No regex or Markdown citation extraction is used.
+Citation validation verifies source membership, not semantic entailment.
+
+`RAG_CONTEXT_MAX_TOKENS` defaults to 8,000, including instructions, question,
+JSON source labels/metadata, evidence, a 256-token framing margin, and reserved
+output (`RAG_MAX_OUTPUT_TOKENS`: documented starting value 1600; code fallback 800
+when absent). One UTF-8 byte counts as one estimated
+token. This intentionally conservative approximation is isolated in `prompt.py`;
+it cannot guarantee the limits of every model/tokenizer. Choose a total budget
+within the selected model's context window. Whole passages that do not fit are
+omitted from the model request, never truncated; returned sources remain intact.
+Citations are checked against the subset actually sent, not all retrieved sources.
+No fitting evidence returns `insufficient_context` / `context_budget_exceeded`
+without calling the provider. Model abstention returns `model_abstained`.
+
+Timeouts (`RAG_LLM_TIMEOUT_SECONDS`, default 20), authentication errors, rate/quota
+limits, provider 5xx/network failures and rejected requests return safe reason
+codes with `generation_unavailable`, `answer: null`, retained sources, and
+`degraded: true`. Invalid generation also retains sources and is degraded. No LLM
+configuration or network failure affects startup, `/search`, `/health`, or sources.
+No real Groq validation is part of automated tests; live validation is separate.
+Safe server-side `Groq provider error:` diagnostics retain only sanitized error
+fields and request facts (model, format, output limit, message byte lengths, and
+source count). Only `json_validate_failed` includes a sanitized `failed_generation`,
+bounded to 2000 characters with escaped line breaks; credential-like content is
+redacted. Diagnostics never dump request headers or complete provider bodies and
+are not exposed through `/ask`.
 
 The RAG path reuses the lexical query builder but reads `_source.clip_text`, never
 search highlights. It requests 30 candidates by default, ranks by BM25 score with
@@ -36,7 +99,11 @@ rather than falsely reporting not-found. Missing or unavailable metadata retains
 identifiers/timestamps with unknown display names and `metadata_available=false`.
 Evidence responses flag `degraded=true` when metadata is unavailable.
 
-Run unit tests with `python -m pytest ingest/tests api/tests`. To also run the
+Run unit tests with `python -m pytest` (or explicit `ingest/tests api/tests`).
+`pytest.ini` restricts discovery to test directories, excluding the legacy CLI
+`scripts/integration_test.py`, whose separate `requests` dependency is undeclared.
+Generation tests use a deterministic fake provider or HTTPX MockTransport, clear
+ambient LLM settings, and prohibit real HTTPX network transports. To also run the
 isolated real-service test in PowerShell:
 
 ```powershell
@@ -44,8 +111,9 @@ $env:RAG_INTEGRATION_TESTS = "1"
 .\.venv\Scripts\python.exe -m pytest api/tests/test_rag_integration.py -v
 ```
 
-The integration test creates/deletes a unique Elasticsearch index and rolls back
-its PostgreSQL metadata transaction. Existing `/search`, Redis caching, ingestion,
+The integration tests exercise evidence-only and fake-generation modes; they
+create/delete unique Elasticsearch indexes and roll back PostgreSQL metadata
+transactions. Existing `/search`, Redis caching, ingestion,
 database schemas, and frontend behavior are unchanged.
 
 A full-stack search engine over the [Spotify Podcast Dataset](https://podcastsdataset.byspotify.com/) that lets users find clips from podcast episodes matching a free-text query. Results display ranked clip cards with highlighted transcript excerpts and speaker attribution.

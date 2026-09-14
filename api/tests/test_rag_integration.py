@@ -13,12 +13,15 @@ from elasticsearch import AsyncElasticsearch
 from httpx import ASGITransport, AsyncClient
 
 import api.main as main
+from api.rag.groq import get_generation_provider
+from api.tests.fake_llm import FakeProvider
 from ingest.es_client import INDEX_MAPPING
 
 
 @pytest.mark.skipif(os.environ.get("RAG_INTEGRATION_TESTS") != "1", reason="Opt-in Docker services test")
 @pytest.mark.asyncio
-async def test_real_bm25_source_resolution_and_staleness(monkeypatch):
+@pytest.mark.parametrize("with_generation", [False, True])
+async def test_real_bm25_source_resolution_and_staleness(monkeypatch, with_generation):
     suffix = uuid4().hex
     index, show, episode = f"rag-test-{suffix}", f"show_{suffix}", f"episode_{suffix}"
     es = AsyncElasticsearch(os.environ.get("ES_HOST", "http://localhost:9200"))
@@ -52,11 +55,19 @@ async def test_real_bm25_source_resolution_and_staleness(monkeypatch):
             monkeypatch.delenv(name, raising=False)
         monkeypatch.setattr(main, "_es_client", es)
         monkeypatch.setattr(main, "_db_pool", conn)
-        async with AsyncClient(transport=ASGITransport(app=main.create_app()), base_url="http://test") as client:
+        app = main.create_app()
+        fake = FakeProvider('{"status":"answered","paragraphs":[{"text":"Machine learning helps identify patterns in research.","source_ids":["S1"]}]}')
+        if with_generation:
+            app.dependency_overrides[get_generation_provider] = lambda: fake
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.post("/ask", json={"question": "machine learning"})
             assert response.status_code == 200, response.text
             body = response.json()
-            assert body["answer"] is None and body["retrieval_mode"] == "bm25"
+            assert body["retrieval_mode"] == "bm25"
+            if with_generation:
+                assert body["status"] == "answered" and body["answer"]["paragraphs"][0]["source_ids"] == ["S1"]
+            else:
+                assert body["answer"] is None
             assert len(body["sources"]) == 1
             source = body["sources"][0]
             assert source["excerpt"] == text and source["show_name"] == "Integration Show"
@@ -70,6 +81,7 @@ async def test_real_bm25_source_resolution_and_staleness(monkeypatch):
                 assert (await restarted.get(url)).status_code == 200
             empty = await client.post("/ask", json={"question": "zxqvnonexistentbaseline"})
             assert empty.json()["status"] == "insufficient_context"
+            assert len(fake.requests) == (2 if with_generation else 0)
             for doc_id in ("first", "duplicate", "overlap"):
                 await es.delete(index=index, id=doc_id)
             await es.indices.refresh(index=index)
