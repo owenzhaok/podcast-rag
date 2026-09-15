@@ -1,6 +1,6 @@
 # Podcast Search
 
-## Optional vector preparation (Stage 6)
+## Optional vector preparation (Stages 6 / 6.5)
 
 Stage 6 is offline preparation only. `/search` is unchanged; `/ask` still uses
 BM25, the Stage 5 generation cache, and Groq. No vector configuration is loaded by
@@ -18,12 +18,11 @@ ID limit); the original chunk ID remains available in the document.
 
 `RAG_EMBEDDING_PROVIDER`, `RAG_EMBEDDING_MODEL`, and `RAG_EMBEDDING_DIMENSIONS` must
 be explicitly configured for the tool. Batch size defaults to 32 (1–200), revision
-to `v1`, and dimensions must be 1–4096. Only the opt-in `fake` provider is currently
-implemented. Its deterministic normalized vectors test plumbing, **not semantic
-similarity**. A real embedding provider/model and its matching dimensions remain
-a deployment decision; add an adapter implementing `EmbeddingProvider.embed`
-before using real embeddings. No paid provider, credentials, SDK, or dependency
-has been added. Never put keys in model/revision identifiers or commit credentials.
+to `v1`. Fake dimensions may be 1–4096; Gemini is configured for exactly 768.
+The `fake` provider's deterministic normalized vectors test plumbing, **not semantic
+similarity**. Stage 6.5 also supports `gemini` / `gemini-embedding-2` through HTTPX,
+without a new SDK or dependency. Never put keys in model/revision identifiers or
+commit credentials. Real Gemini usage may incur provider charges.
 
 Commands use the process environment and existing `ES_HOST`/`RAG_SOURCE_INDEX`:
 
@@ -49,9 +48,11 @@ can leave part of its batch complete, and rerunning safely fills the remainder.
 No global in-memory deduplication set or automatic startup work is used.
 
 Changed exact transcript content has a new identity and creates a new document;
-old identities are retained, never silently deleted. Model/revision changes with
-the same dimensions re-embed existing identities. Dimension changes require a
-new versioned index. Run one backfill per target at a time; after interruption or
+old identities are retained, never silently deleted. Revision changes re-embed
+existing identities. Gemini refuses an index containing fake or different-model
+vectors: provider/model/dimension migrations require a new versioned index.
+Fake-only Stage 6 model-change tests retain their existing behavior.
+Run one backfill per target at a time; after interruption or
 a model change, finish a full intended scan before using that index in future
 retrieval. A limited rerun begins from the start and is not a persistent cursor.
 
@@ -134,6 +135,127 @@ and cleans up only its own unique indices:
 $env:RAG_INTEGRATION_TESTS = '1'
 .\.venv\Scripts\python.exe -B -m pytest api/tests/test_vector_preparation.py -q
 ```
+
+### Gemini preparation (Stage 6.5): manual live validation
+
+The adapter sends `POST .../models/<configured-model>:embedContent`, with the key
+only in `x-goog-api-key`, and requests `outputDimensionality=768`. See the
+[Gemini embedding REST documentation](https://ai.google.dev/gemini-api/docs/embeddings).
+It makes sequential requests inside each existing backfill batch, validates all
+vectors before writing that batch, and performs no automatic retries. The timeout
+is `RAG_EMBEDDING_TIMEOUT_SECONDS=20` per HTTP operation. Responses are bounded to
+128 KiB; HTTP/network errors contain only safe reasons, never provider bodies.
+The scroll lease is 30 minutes to accommodate sequential requests. Use small
+batches during initial validation; complete previous batches survive failures.
+
+Gemini's canonical input is `title: <episode title> | text: <exact transcript>`.
+The CLI reads episode titles from PostgreSQL in a bounded read-only batch lookup;
+missing/unavailable metadata uses `<podcast_id>/<episode_id>` as the title.
+`gemini-document-v1` and the SHA-256 of this exact input are stored alongside the
+unchanged Stage 2 identity. Title changes therefore invalidate skip eligibility.
+Changing formatting requires a format-version and embedding-revision bump.
+Do not reuse a revision with a different format; preflight rejects this case.
+Fake providers retain the Stage 6 raw-transcript convention. Stage 7 must add a
+compatible query convention explicitly; no query embeddings or hybrid retrieval
+are active now. To avoid silent truncation, canonical Gemini inputs above 8192
+UTF-8 bytes stop rather than being shortened; this is a conservative token proxy.
+
+Use your existing `RAG_EMBEDDING_API_KEY` environment variable. Do not paste it
+into commands, source files, examples, or output. These commands make **real**
+Gemini requests only when you run them manually. Automated tests never do.
+
+**Phase A — two duplicate sample clips, one real vector:**
+
+```powershell
+if (-not $env:RAG_EMBEDDING_API_KEY) { throw 'Configure the key privately in the local environment first' }
+$es = 'http://localhost:9200'
+$env:RAG_EMBEDDING_PROVIDER = 'gemini'
+$env:RAG_EMBEDDING_MODEL = 'gemini-embedding-2'
+$env:RAG_EMBEDDING_DIMENSIONS = '768'
+$env:RAG_EMBEDDING_REVISION = 'v1'
+$env:RAG_EMBEDDING_BATCH_SIZE = '2'
+$env:RAG_EMBEDDING_TIMEOUT_SECONDS = '20'
+$suffix = [guid]::NewGuid().ToString('N')
+$env:RAG_SOURCE_INDEX = "rag-gemini-source-$suffix"
+$env:RAG_VECTOR_INDEX = "rag-gemini-vector-$suffix"
+$sourceUrl = "$es/$env:RAG_SOURCE_INDEX"
+$vectorUrl = "$es/$env:RAG_VECTOR_INDEX"
+function Invoke-VectorTool([string]$Action, [int]$Limit = 0) {
+  if ($Action -eq 'backfill') {
+    & .\.venv\Scripts\python.exe -B -m api.rag.backfill backfill --limit $Limit
+  } else {
+    & .\.venv\Scripts\python.exe -B -m api.rag.backfill $Action
+  }
+  if ($LASTEXITCODE -ne 0) { throw 'Vector tool failed; stop and inspect the safe error' }
+}
+Invoke-RestMethod -Method Put $sourceUrl -ContentType 'application/json' `
+  -Body '{"settings":{"number_of_shards":1,"number_of_replicas":0}}'
+$sample = @{podcast_id='gemini-demo'; episode_id='gemini-demo-episode'; clip_index=0;
+  clip_start_ms=0; clip_end_ms=120000; speakers=@(1);
+  clip_text='Machine learning identifies patterns in research.'} | ConvertTo-Json
+foreach ($id in @('one','duplicate')) {
+  Invoke-RestMethod -Method Put "$sourceUrl/_doc/${id}?refresh=true" `
+    -ContentType 'application/json' -Body $sample
+}
+Invoke-VectorTool create
+Invoke-VectorTool check
+Invoke-VectorTool backfill 10
+Invoke-RestMethod -Method Post "$vectorUrl/_refresh"
+$first = Invoke-RestMethod "$vectorUrl/_search?size=100"
+if ($first.hits.total.value -ne 1) { throw 'Expected one unique vector' }
+if ($first.hits.hits[0]._source.embedding.Count -ne 768) { throw 'Wrong dimension' }
+Invoke-VectorTool backfill 10 # Must report written=0.
+Invoke-RestMethod -Method Post "$vectorUrl/_refresh"
+$second = Invoke-RestMethod "$vectorUrl/_search?size=100"
+if ($second.hits.total.value -ne 1 -or $first.hits.hits[0]._id -ne $second.hits.hits[0]._id) { throw 'Idempotence failed' }
+$phaseAPassed = $true
+```
+
+**Phase B — only after Phase A succeeds:**
+
+```powershell
+if (-not $phaseAPassed) { throw 'Finish Phase A first' }
+$env:RAG_SOURCE_INDEX = 'podcast_clips'
+$env:RAG_VECTOR_INDEX = 'podcast_rag_v1'
+$vectorUrl = "$es/$env:RAG_VECTOR_INDEX"
+$originalCount = (Invoke-RestMethod "$es/podcast_clips/_count").count
+if ($originalCount -ne 25) { throw 'Corpus changed; review the intended scan limit first' }
+$original = Invoke-RestMethod "$es/podcast_clips/_search?size=100"
+$originalMapping = Invoke-RestMethod "$es/podcast_clips/_mapping"
+# Compute expected UNIQUE stable IDs, not the number of possibly duplicated source clips.
+$expected = & .\.venv\Scripts\python.exe -B -c 'from elasticsearch import Elasticsearch; from api.rag.retrieval import parse_hit; es=Elasticsearch("http://localhost:9200"); hits=es.search(index="podcast_clips",size=100)["hits"]["hits"]; clips=[parse_hit(h) for h in hits]; assert all(clips); print(len({c.chunk_id for c in clips})); es.close()'
+if ($LASTEXITCODE -ne 0) { throw 'Expected identity count failed' }
+Invoke-VectorTool create # Creates only if absent; otherwise checks without recreation.
+Invoke-VectorTool check  # Rejects incompatible mapping, fake/other models, or old format.
+# If either fails, STOP. Use a new versioned index after review; never delete the old index.
+Invoke-VectorTool backfill 25
+Invoke-RestMethod -Method Post "$vectorUrl/_refresh"
+$vectors = Invoke-RestMethod "$vectorUrl/_search?size=100"
+if ($vectors.hits.total.value -ne [int]$expected) { throw 'Unexpected vector count; investigate without deleting data' }
+foreach ($hit in $vectors.hits.hits) {
+  $doc = $hit._source
+  if ($doc.embedding.Count -ne 768 -or $doc.embedding_provider -ne 'gemini' -or
+      $doc.embedding_model -ne 'gemini-embedding-2' -or $doc.embedding_revision -ne 'v1') {
+    throw 'Vector metadata mismatch'
+  }
+}
+Invoke-VectorTool backfill 25 # Must report written=0.
+Invoke-RestMethod -Method Post "$vectorUrl/_refresh"
+$again = Invoke-RestMethod "$vectorUrl/_search?size=100"
+if (($vectors.hits.hits._id | Sort-Object | ConvertTo-Json) -ne
+    ($again.hits.hits._id | Sort-Object | ConvertTo-Json)) { throw 'Vector IDs changed' }
+$after = Invoke-RestMethod "$es/podcast_clips/_search?size=100"
+if (($original.hits.hits | Sort-Object _id | ConvertTo-Json -Depth 30 -Compress) -ne
+    ($after.hits.hits | Sort-Object _id | ConvertTo-Json -Depth 30 -Compress)) { throw 'Source changed' }
+if ((Invoke-RestMethod "$es/podcast_clips/_count").count -ne $originalCount) { throw 'Source count changed' }
+if (($originalMapping | ConvertTo-Json -Depth 30 -Compress) -ne
+    ((Invoke-RestMethod "$es/podcast_clips/_mapping") | ConvertTo-Json -Depth 30 -Compress)) { throw 'Source mapping changed' }
+```
+
+Use the evidence-only API on port 8001 described above to check `/ask` still
+reports `retrieval_mode=bm25`, without invoking Groq. No commands delete indices,
+Docker volumes, or the retained Elasticsearch backup. The Phase A indices remain
+available for inspection. Do not use fake embeddings in the production companion.
 
 ## RAG generation cache (Stage 5)
 

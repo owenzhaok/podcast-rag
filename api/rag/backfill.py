@@ -9,6 +9,7 @@ from itertools import islice
 from elasticsearch import Elasticsearch, helpers
 
 from api.rag.embeddings import EmbeddingProvider, validate_embeddings
+from api.rag.embedding_input import DOCUMENT_INPUT_VERSION, document_input, episode_titles
 from api.rag.retrieval import FIELDS, parse_hit
 from api.rag.sources import decode_chunk_id
 from api.rag.vector_index import VectorConfig, check_index, create_index
@@ -34,8 +35,15 @@ def vector_document(hit: dict, config: VectorConfig) -> tuple[str, dict]:
     }
 
 
-def process_batch(es, config: VectorConfig, provider: EmbeddingProvider, hits: list[dict]) -> dict:
+def process_batch(es, config: VectorConfig, provider: EmbeddingProvider, hits: list[dict], title_lookup=None) -> dict:
     documents = dict(vector_document(hit, config) for hit in hits)
+    inputs = {doc_id: doc["chunk_text"] for doc_id, doc in documents.items()}
+    if config.provider == "gemini":
+        titles = title_lookup(sorted({doc["episode_id"] for doc in documents.values()})) if title_lookup else {}
+        for doc_id, doc in documents.items():
+            inputs[doc_id] = document_input(doc, titles.get(doc["episode_id"]))
+            doc["embedding_input_version"] = DOCUMENT_INPUT_VERSION
+            doc["embedding_input_hash"] = hashlib.sha256(inputs[doc_id].encode("utf-8")).hexdigest()
     existing = es.mget(index=config.vector_index, ids=list(documents), realtime=True)["docs"]
     if len(existing) != len(documents) or any("error" in doc for doc in existing):
         raise ValueError("Unable to check existing vector documents")
@@ -52,7 +60,7 @@ def process_batch(es, config: VectorConfig, provider: EmbeddingProvider, hits: l
         pending[doc_id] = document
     if pending:
         try:
-            vectors = provider.embed([doc["chunk_text"] for doc in pending.values()])
+            vectors = provider.embed([inputs[doc_id] for doc_id in pending])
         except Exception:
             raise ValueError("Embedding provider failed; completed batches remain intact") from None
         validate_embeddings(vectors, len(pending), config.dimensions)
@@ -65,7 +73,7 @@ def process_batch(es, config: VectorConfig, provider: EmbeddingProvider, hits: l
     return {"scanned": len(hits), "written": len(pending), "skipped": len(hits) - len(pending)}
 
 
-def backfill(es, config: VectorConfig, provider: EmbeddingProvider, limit: int, progress=print) -> dict:
+def backfill(es, config: VectorConfig, provider: EmbeddingProvider, limit: int, progress=print, title_lookup=None) -> dict:
     config.validate()
     if limit < 1:
         raise ValueError("An explicit positive document limit is required")
@@ -73,14 +81,14 @@ def backfill(es, config: VectorConfig, provider: EmbeddingProvider, limit: int, 
     if set(es.indices.get_mapping(index=config.source_index)) != {config.source_index}:
         raise ValueError("Source must be one concrete index, not an alias")
     totals = {"scanned": 0, "written": 0, "skipped": 0}
-    stream = helpers.scan(es, index=config.source_index, size=config.batch_size, scroll="2m",
+    stream = helpers.scan(es, index=config.source_index, size=config.batch_size, scroll="30m",
                           query={"query": {"match_all": {}}, "_source": FIELDS}, clear_scroll=True)
     try:
         while totals["scanned"] < limit:
             hits = list(islice(stream, min(config.batch_size, limit - totals["scanned"])))
             if not hits:
                 break
-            result = process_batch(es, config, provider, hits)
+            result = process_batch(es, config, provider, hits, title_lookup)
             for key, value in result.items():
                 totals[key] += value
             progress(json.dumps(totals))  # Counts only; no transcript or provider error bodies.
@@ -106,7 +114,7 @@ def main():
             elif args.command == "check":
                 check_index(es, config)
             else:
-                backfill(es, config, provider, args.limit)
+                backfill(es, config, provider, args.limit, title_lookup=episode_titles)
             print("Vector preparation complete; active retrieval remains BM25.")
     except ValueError as exc:
         parser.exit(1, str(exc) + "\n")
