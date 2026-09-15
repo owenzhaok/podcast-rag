@@ -1,5 +1,116 @@
 # Podcast Search
 
+## Small real Spotify source sample (Stage 8.5A)
+
+`python -m ingest.spotify_sample` streams transcript JSON directly from the nested
+ZIP/tar.gz dataset. It does not extract tarballs, run ingestion on API startup,
+create vectors, or change the synthetic workflow or active `/ask` source index.
+The default write target is **podcast_clips_real_v1**. Only concrete index names
+beginning `podcast_clips_real_` are accepted. Aliases, wildcard targets, existing
+indexes with incompatible mappings/provenance, and the synthetic/vector indexes
+are refused. There is no delete/recreate option.
+
+Sampling follows the existing tar member order, starts with
+`podcasts-transcripts-0to2.tar.gz`, accepts English metadata (`en`, `['en']`, etc.),
+and takes at most `--max-per-show 5` episodes per show. It stops reading transcripts
+as soon as `--episodes N` usable episodes have been accepted. Non-English/missing
+metadata, unreadable transcripts and empty clips do not consume accepted slots.
+This is reproducible for the same archive/metadata and options, not random or
+representative sampling. If the shard is exhausted first, the CLI reports
+`sample_complete=false` and exits 1. An operational failure exits 2; diagnostics
+never print raw dataset/provider/database error bodies.
+
+The metadata TSV is read once into an automatically cleaned temporary SQLite
+lookup, including English rows only. This uses temporary disk space proportional
+to metadata size, not RAM proportional to the dataset. Transcript memory is
+bounded to one episode: at most 16 MiB JSON and 50000 retained words (100000 input
+word entries allowing a repeated final aggregate), with timestamps bounded to
+24 hours. Python's retained tar-header history is cleared as the scan proceeds.
+No member is extracted to a filesystem path. Progress is counts only.
+
+Parsing uses `alternatives[0].words`, exact decimal seconds converted to integer
+milliseconds, and the existing `WordRecord` and `segment()` helper. It preserves
+word order, zero-duration ASR words and speaker tags (missing tags default to 0).
+An exact repeated final diarized aggregate replaces the preceding word sequence,
+matching the existing parser's canonical convention without duplicating words;
+otherwise result segments are concatenated. Invalid word records are skipped and
+counted. Backwards timestamp ordering is counted separately and preserved, not
+silently sorted. Missing/empty result entries are counted even when a valid final
+aggregate allows the episode to be used. `malformed_transcripts` therefore includes
+partially usable episodes, not just rejected files.
+
+Clips use the existing default 120-second windows/60-second overlap, actual
+first/last word endpoints and lexical mapping. The CLI also honors existing
+`CLIP_DURATION_DEFAULT`/`CLIP_OVERLAP`, or explicit window arguments. Documents keep
+`podcast_id`, `episode_id`, `clip_index`, `clip_start_ms`, `clip_end_ms`, `clip_text`,
+`word_timestamps` and `speakers`. Additive keyword provenance includes Stage 2
+`chunk_id`, show/episode filename prefixes and URIs, dataset identifier
+`spotify-podcasts-2020`, archive/member names and chunking version. Filename prefixes
+remain available for later compliance/retraction handling. Elasticsearch IDs are
+SHA-256 of the existing stable chunk ID, compatible with vector preparation.
+
+Only selected episodes' metadata is inserted into the existing PostgreSQL
+`shows`/`episodes` tables, using filename prefixes as IDs and the existing columns.
+Titles therefore work with normal enrichment and future Gemini document inputs.
+Existing metadata is never overwritten: matching rows are reused, conflicts stop
+the run and roll back that episode's metadata transaction. This protects the
+synthetic metadata path. PostgreSQL must be available for write runs. Metadata
+commits before an episode's Elasticsearch writes; a failed write can leave metadata
+or a partial episode, and rerunning fills the missing chunks.
+
+Chunks use create-only writes; existing deterministic IDs count as `chunks_existing`
+(HTTP 409), not duplicates. Resume by repeating the same command. The index records
+archive/metadata ZIP CRCs, parser version, language, show cap and window settings;
+changing these requires a new versioned real index. CRCs identify the supplied
+archive, not cryptographically authenticate it; use one importer per target.
+Increasing `--episodes 20` to `--episodes 100` extends the same deterministic sample.
+Reducing the limit does **not** remove previously ingested episodes. For a separate
+sample use a fresh name such as `podcast_clips_real_v2`; nothing is automatically
+deleted. Resume scans again from the archive start rather than seeking within gzip.
+`chunks_produced` counts windows before logical deduplication; identical windows
+share an ID, so the stored document count can be smaller than that counter.
+
+### Stage 8.5A PowerShell validation
+
+Keep the original dataset outside the repository. Do not commit real transcripts,
+metadata rows, extracted files or evaluation results. Tests create tiny synthetic
+archives dynamically. No real write run is required to run the tests.
+
+```powershell
+$dataset = 'D:\Datasets\podcast-rag\raw\podcasts-no-audio-13GB.zip'
+$es = 'http://localhost:9200'
+$sourceBefore = (Invoke-RestMethod "$es/podcast_clips/_count").count
+$vectorBefore = (Invoke-RestMethod "$es/podcast_rag_v1/_count").count
+
+# Parse, join and chunk 20 episodes; no Elasticsearch/PostgreSQL connections.
+.\.venv\Scripts\python.exe -B -m ingest.spotify_sample --zip $dataset --episodes 20 --max-per-show 5 --clip-duration 120 --overlap 60 --dry-run
+if ($LASTEXITCODE -ne 0) { throw 'Dry run incomplete or failed' }
+
+# Existing ES_HOST/POSTGRES_DSN environment settings are reused, with the same
+# localhost defaults as the backend. Do not print connection credentials.
+.\.venv\Scripts\python.exe -B -m ingest.spotify_sample --zip $dataset --episodes 20 --max-per-show 5 --clip-duration 120 --overlap 60 --index podcast_clips_real_v1
+if ($LASTEXITCODE -ne 0) { throw 'Ingestion stopped; check services/target/metadata conflicts before resuming' }
+
+# Refresh only the new real index so counts are immediately visible.
+Invoke-RestMethod "$es/podcast_clips_real_v1/_refresh" -Method Post | Out-Null
+Invoke-RestMethod "$es/podcast_clips_real_v1/_count"
+Invoke-RestMethod "$es/podcast_clips_real_v1/_mapping"
+$body = @{size=3; _source=@('chunk_id','podcast_id','episode_id','show_filename_prefix','episode_filename_prefix','episode_uri','clip_start_ms','clip_end_ms','source_dataset','source_archive')} | ConvertTo-Json -Depth 5
+$sample = Invoke-RestMethod "$es/podcast_clips_real_v1/_search" -Method Post -ContentType 'application/json' -Body $body
+$sample.hits.hits | ForEach-Object { $_._source } | Format-List
+
+# Same command resumes/idempotently verifies the sample: expect chunks_written=0.
+.\.venv\Scripts\python.exe -B -m ingest.spotify_sample --zip $dataset --episodes 20 --max-per-show 5 --clip-duration 120 --overlap 60 --index podcast_clips_real_v1
+if ($LASTEXITCODE -ne 0) { throw 'Repeat ingestion failed' }
+if ((Invoke-RestMethod "$es/podcast_clips/_count").count -ne $sourceBefore) { throw 'Synthetic source count changed' }
+if ((Invoke-RestMethod "$es/podcast_rag_v1/_count").count -ne $vectorBefore) { throw 'Synthetic vector count changed' }
+```
+
+Inspect transcript text locally only when needed by adding `clip_text` to the
+sample request; do not save it as a test fixture or paste it into committed reports.
+No RAG settings need changing. Real vectors and subsequent workflow stages are
+outside Stage 8.5A.
+
 ## Offline retrieval evaluation (Stage 8)
 
 Run `python -m api.rag.evaluate --dataset <file> --mode bm25|hybrid|both
