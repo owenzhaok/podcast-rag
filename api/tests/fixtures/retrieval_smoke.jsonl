@@ -1,0 +1,2 @@
+{"query":"What is discussed?","relevant_chunk_ids":["smoke-a","smoke-b"],"notes":"Test-only judgments for deterministic doubles, not the production corpus."}
+{"query":"Which topic is relevant?","relevant_chunk_ids":["smoke-c"]}

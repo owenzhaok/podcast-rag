@@ -1,5 +1,153 @@
 # Podcast Search
 
+## Offline retrieval evaluation (Stage 8)
+
+Run `python -m api.rag.evaluate --dataset <file> --mode bm25|hybrid|both
+--output .local-eval/report.json`. Both CLI and server defaults remain BM25;
+`RAG_RETRIEVAL_MODE=bm25` is unchanged. The explicit CLI mode does not change the
+server environment. No API server, Groq, generation cache or PostgreSQL is needed.
+Hybrid alone uses your server/local Gemini configuration and may incur Gemini
+charges. Normal tests use deterministic doubles, never real provider calls.
+
+Datasets are UTF-8 JSON arrays (or one object), or `.jsonl` with one object per
+nonblank line. Example (replace these illustrative IDs with reviewed corpus IDs):
+
+```json
+[
+  {"query":"What are the benefits of machine learning?","relevant_chunk_ids":["<chunk ID 1>","<chunk ID 2>"],"notes":"Human-reviewed binary judgments"}
+]
+```
+
+`query` is a nonblank string, at most 2000 characters, trimmed as in `/ask`.
+`relevant_chunk_ids` is a required list of stable Stage 2 IDs, not `S1` labels or
+Elasticsearch document IDs. `notes` is an optional string. Unknown fields and
+malformed records fail validation. Limits: 5 MiB, 10000 queries, 10000 relevance
+IDs per query. Duplicate relevant IDs are collapsed. The committed two-row
+`api/tests/fixtures/retrieval_smoke.jsonl` is for test doubles only, not production
+evaluation. Judge relevance independently; do not use a retriever's own results
+as ground truth. Each row has equal weight, including repeated questions.
+
+Metrics use binary relevance and the **final selected source list**, after RRF
+(if enabled), deduplication, overlap suppression, source count and evidence-byte
+limits. They precede generation's model-context budgeting. Duplicate retrieved
+IDs are removed while preserving first occurrence and compressing ranks.
+
+- Hit Rate@1/@3/@5: fraction of queries with at least one relevant result in top k.
+- Recall@1/@3/@5: macro average of unique relevant hits in top k divided by all
+  judged relevant IDs for that query; multiple relevant IDs affect the denominator.
+- MRR: macro average of reciprocal rank of the first relevant result in the entire
+  returned list (bounded by `RAG_MAX_SOURCES`, normally six); zero if none is found.
+- nDCG@5: binary DCG uses `1/log2(rank+1)` for each relevant result, divided by the
+  ideal DCG for `min(5, number of relevant IDs)` relevant results.
+- Mean/median latency: milliseconds for each retrieval attempt, including Gemini
+  query embedding, kNN, source hydration and selection; excluding connection setup,
+  PostgreSQL metadata lookup, generation and report writing. No warmup or retries.
+
+Empty results score zero. Queries explicitly labeled with no relevant IDs score
+zero for all relevance metrics and remain in macro averages. Fewer-than-k results
+are used as returned; recall is not rescaled to list length. Infrastructure errors
+also score as empty retrieval and are counted separately rather than dropped.
+The CLI saves the report then exits 1 if any retrieval failed; startup/input/output
+errors exit 2. Hybrid fallback with working BM25 is a successful evaluation attempt.
+
+Hybrid summaries report successful hybrid count/rate and BM25 fallback count/rate,
+using **all attempted queries** as denominator. Actual BM25 results include both
+vector failures and no usable vector candidates; `vector_failure_count` and
+`no_usable_vector_count` distinguish them. Retrieval errors are neither hybrid
+successes nor BM25 fallbacks. Scores for hybrid include its fallbacks, reflecting
+the behavior users receive. Do not present those scores as vector-only performance.
+
+Console output summarizes scores and fallback counts. JSON contains per-query
+numbers, judged/retrieved IDs, metrics, actual mode, safe errors, timings, aggregate
+scores, dataset fingerprint, candidate limits, RRF k, source/embedding configuration,
+and query/document format versions. It omits query text, notes, transcripts, API
+keys, connection URLs and LLM settings. The fingerprint hashes normalized queries
+and sorted relevance sets in dataset order (notes excluded). Keep keys out of all
+dataset and configuration identifiers. Reports go in gitignored `.local-eval/`.
+
+`both` uses the same dataset/configuration, processing each query with BM25 then
+Hybrid. Existing caches and index warmth can influence timing; this is not a
+load benchmark. Record a fixed corpus and identical selection limits for comparisons.
+The current 25 synthetic clips support **functional evaluation only**. No result
+from this smoke corpus establishes that Hybrid is better, and no default switch
+is recommended. Stage 9 is not implemented.
+
+### Manual Stage 8 validation (PowerShell)
+
+Run from the repository root, with the existing Gemini key present only in your
+local environment. These commands use real Gemini for the Hybrid run, never Groq.
+Do not perform ingestion/backfill concurrently with this comparison.
+
+```powershell
+$es = 'http://localhost:9200'
+foreach ($index in @('podcast_clips', 'podcast_rag_v1')) {
+  if ((Invoke-RestMethod "$es/$index/_count").count -ne 25) { throw "Unexpected count: $index" }
+}
+function Get-EvalSnapshot {
+  $records = foreach ($index in @('podcast_clips', 'podcast_rag_v1')) {
+    $mapping = Invoke-RestMethod "$es/$index/_mapping"
+    $settings = Invoke-RestMethod "$es/$index/_settings"
+    $data = Invoke-RestMethod "$es/$index/_search?size=100&seq_no_primary_term=true"
+    [ordered]@{index=$index; mapping=$mapping; settings=$settings; documents=@($data.hits.hits | Sort-Object _id)}
+  }
+  ConvertTo-Json -InputObject @($records) -Depth 40 -Compress
+}
+$before = Get-EvalSnapshot
+New-Item -ItemType Directory -Force '.local-eval' | Out-Null
+$env:ES_HOST = $es
+$env:RAG_SOURCE_INDEX = 'podcast_clips'
+$env:RAG_VECTOR_INDEX = 'podcast_rag_v1'
+$env:RAG_RETRIEVAL_MODE = 'bm25'
+$env:RAG_CANDIDATE_LIMIT = '30'
+$env:RAG_MAX_SOURCES = '6'
+$env:RAG_CONTEXT_MAX_BYTES = '16000'
+```
+
+Prepare `.local-eval/queries.jsonl` with independently reviewed questions and chunk
+IDs. This read-only command lists canonical IDs, episode IDs and timestamps to help
+identify clips; consult their canonical transcripts when assigning relevance:
+
+```powershell
+.\.venv\Scripts\python.exe -B -c "from elasticsearch import Elasticsearch; from api.rag.retrieval import parse_hit; import json,os; es=Elasticsearch(os.environ['ES_HOST']); hits=es.search(index='podcast_clips',size=100)['hits']['hits']; print(json.dumps([{'chunk_id':c.chunk_id,'episode_id':c.episode_id,'start_ms':c.start_ms} for h in hits if (c:=parse_hit(h))],indent=2)); es.close()"
+# Repeat this block for each independently judged question. Enter one or more
+# relevant IDs separated by commas; leave empty only for explicitly unanswerable queries.
+$question = Read-Host 'Enter an independently judged question'
+$ids = Read-Host 'Enter reviewed relevant chunk IDs, comma-separated'
+$judgment = @{query=$question; relevant_chunk_ids=@($ids.Split(',') | ForEach-Object {$_.Trim()} | Where-Object {$_}); notes='Human-reviewed functional smoke judgment'}
+$judgment | ConvertTo-Json -Compress | Add-Content -Encoding UTF8 '.local-eval/queries.jsonl'
+
+.\.venv\Scripts\python.exe -B -m api.rag.evaluate --dataset .local-eval/queries.jsonl --mode bm25 --output .local-eval/bm25.json
+if ($LASTEXITCODE -ne 0) { throw 'BM25 evaluation failed; inspect safe report errors' }
+
+if (-not $env:RAG_EMBEDDING_API_KEY) { throw 'Existing local Gemini key is required; do not print it' }
+$env:RAG_EMBEDDING_PROVIDER = 'gemini'
+$env:RAG_EMBEDDING_MODEL = 'gemini-embedding-2'
+$env:RAG_EMBEDDING_DIMENSIONS = '768'
+$env:RAG_EMBEDDING_REVISION = 'v1'
+$env:RAG_EMBEDDING_TIMEOUT_SECONDS = '20'
+.\.venv\Scripts\python.exe -B -m api.rag.evaluate --dataset .local-eval/queries.jsonl --mode hybrid --output .local-eval/hybrid.json
+if ($LASTEXITCODE -ne 0) { throw 'Hybrid evaluation failed; inspect safe report errors' }
+
+$bm = Get-Content .local-eval/bm25.json -Raw | ConvertFrom-Json
+$hy = Get-Content .local-eval/hybrid.json -Raw | ConvertFrom-Json
+if ($bm.dataset_sha256 -ne $hy.dataset_sha256) { throw 'Different judgments; do not compare' }
+'functional evaluation only'
+$comparison = foreach ($metric in $bm.runs.bm25.summary.metrics.PSObject.Properties.Name) {
+  [pscustomobject]@{Metric=$metric; BM25=$bm.runs.bm25.summary.metrics.$metric; Hybrid=$hy.runs.hybrid.summary.metrics.$metric}
+}
+$comparison | Format-Table
+$hy.runs.hybrid.summary | Select-Object successful_hybrid_count, successful_hybrid_rate, bm25_fallback_count, bm25_fallback_rate, vector_failure_count, no_usable_vector_count, error_count
+if ((Get-EvalSnapshot) -ne $before) { throw 'Elasticsearch indices changed during evaluation' }
+foreach ($index in @('podcast_clips', 'podcast_rag_v1')) {
+  if ((Invoke-RestMethod "$es/$index/_count").count -ne 25) { throw "Unexpected count: $index" }
+}
+git check-ignore .local-eval/bm25.json .local-eval/hybrid.json
+```
+
+For a single combined run, use `--mode both --output .local-eval/both.json` instead
+of the two separate runs. This makes additional Gemini calls; it is not necessary
+after the comparison above. Keep `RAG_RETRIEVAL_MODE=bm25` unchanged.
+
 ## Optional vector preparation (Stages 6 / 6.5)
 
 Stage 6 is offline preparation only. `/search` is unchanged; `/ask` still uses
@@ -296,8 +444,8 @@ Different hybrid context cannot reuse an old BM25 generation. Identical effectiv
 generation requests can safely share a cached result across modes; responses use
 current sources and the actual current retrieval mode. No cache-key migration is needed.
 
-Stage 8 will evaluate quality before considering a different default. The current
-25-clip synthetic corpus supports functional validation only, not quality claims.
+Stage 8 supplies offline comparisons before any default change is considered.
+The current 25-clip synthetic corpus supports functional validation only, not quality claims.
 
 ### Manual hybrid validation (PowerShell; real Gemini, no Groq)
 
