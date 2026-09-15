@@ -5,7 +5,7 @@
 Stage 6 is offline preparation only. `/search` is unchanged; `/ask` still uses
 BM25, the Stage 5 generation cache, and Groq. No vector configuration is loaded by
 API startup and no vector state is added to the active generation-cache identity.
-Hybrid retrieval is reserved for Stage 7.
+Stage 7 optionally enables hybrid retrieval as documented below; BM25 remains default.
 
 The companion index defaults to `RAG_VECTOR_INDEX=podcast_rag_v1`. It uses a strict
 mapping with an indexed float `dense_vector`, explicit dimensions, cosine
@@ -155,9 +155,8 @@ missing/unavailable metadata uses `<podcast_id>/<episode_id>` as the title.
 unchanged Stage 2 identity. Title changes therefore invalidate skip eligibility.
 Changing formatting requires a format-version and embedding-revision bump.
 Do not reuse a revision with a different format; preflight rejects this case.
-Fake providers retain the Stage 6 raw-transcript convention. Stage 7 must add a
-compatible query convention explicitly; no query embeddings or hybrid retrieval
-are active now. To avoid silent truncation, canonical Gemini inputs above 8192
+Fake providers retain the Stage 6 raw-transcript convention. Stage 6.5 preparation
+does not itself activate hybrid retrieval. To avoid silent truncation, canonical Gemini inputs above 8192
 UTF-8 bytes stop rather than being shortened; this is a conservative token proxy.
 
 Use your existing `RAG_EMBEDDING_API_KEY` environment variable. Do not paste it
@@ -257,6 +256,132 @@ reports `retrieval_mode=bm25`, without invoking Groq. No commands delete indices
 Docker volumes, or the retained Elasticsearch backup. The Phase A indices remain
 available for inspection. Do not use fake embeddings in the production companion.
 
+## Optional hybrid retrieval (Stage 7)
+
+`RAG_RETRIEVAL_MODE=bm25` remains the default. Only `hybrid` opts into Gemini query
+embeddings, Elasticsearch kNN and application-side Reciprocal Rank Fusion (RRF).
+Unknown mode values safely select BM25. `/search` and its cache are unchanged.
+BM25 startup and retrieval need no Gemini key, vector index or embedding settings.
+
+Hybrid uses the existing `gemini` / `gemini-embedding-2` adapter, exactly 768
+dimensions, `RAG_EMBEDDING_REVISION=v1`, and `podcast_rag_v1` by default. The query
+convention is **gemini-query-v1**: `task: question answering | query: <exact user question>`.
+The **gemini-document-v1** preparation format is unchanged. Credentials stay on
+the server; no browser provider requests, backfills, index refreshes or writes occur.
+
+BM25 requests `RAG_CANDIDATE_LIMIT` (default 30) candidates; vector retrieval takes
+30 with `num_candidates=100`. kNN filters provider, model, revision, input format,
+chunking version and source index. The vector mapping is checked before embedding.
+Vector hits must resolve to the same exact text/hash in the canonical source index;
+missing, stale or mismatching hits are discarded. Metadata comes from PostgreSQL.
+Each unique chunk contributes `1 / (60 + rank)` per list, with ranks starting at
+one after duplicate removal. Contributions are summed by stable Stage 2 chunk ID;
+ties use chunk ID. Existing overlap suppression, source counts, evidence-byte
+limits and generation context budgets apply after fusion.
+
+Failures in Gemini, configuration, vector mapping, kNN or canonical hydration
+fail open to BM25 with `retrieval_mode="bm25"` and `degraded=true`. A successful
+answer in that case has safe reason `hybrid_retrieval_unavailable`; existing
+generation/no-evidence reasons take precedence. No usable vector hits also leaves
+the BM25 order/mode unchanged, without marking an otherwise successful empty
+vector search as a provider failure. `hybrid` means validated vector candidates
+participated in fusion. Lexical infrastructure failures retain the existing 503.
+Vector work is bounded by the embedding timeout plus 15 seconds, with up to four
+canonical lookups at once. The synchronous Gemini adapter runs off the event loop;
+a canceled request can leave its worker finishing until the HTTP timeout.
+
+Retrieval still runs before every generation-cache lookup. Its identity already
+hashes the effective prompt, including evidence text, order, labels and metadata.
+Different hybrid context cannot reuse an old BM25 generation. Identical effective
+generation requests can safely share a cached result across modes; responses use
+current sources and the actual current retrieval mode. No cache-key migration is needed.
+
+Stage 8 will evaluate quality before considering a different default. The current
+25-clip synthetic corpus supports functional validation only, not quality claims.
+
+### Manual hybrid validation (PowerShell; real Gemini, no Groq)
+
+Use two terminals in the repository root. Keep your existing Gemini key in the
+server terminal's local environment; do not print or paste it into these commands.
+The following requests use Gemini quota. They do not write either index.
+
+Terminal 1 — start a separate evidence-only API (no `--env-file` needed):
+
+```powershell
+if (-not $env:RAG_EMBEDDING_API_KEY) { throw 'Set your existing key locally first; do not print it' }
+$env:RAG_ENABLED = 'true'
+$env:RAG_RETRIEVAL_MODE = 'hybrid'
+$env:RAG_LLM_PROVIDER = ''
+$env:RAG_SOURCE_INDEX = 'podcast_clips'
+$env:RAG_VECTOR_INDEX = 'podcast_rag_v1'
+$env:RAG_EMBEDDING_PROVIDER = 'gemini'
+$env:RAG_EMBEDDING_MODEL = 'gemini-embedding-2'
+$env:RAG_EMBEDDING_DIMENSIONS = '768'
+$env:RAG_EMBEDDING_REVISION = 'v1'
+$env:RAG_EMBEDDING_TIMEOUT_SECONDS = '20'
+.\.venv\Scripts\python.exe -B -m uvicorn api.main:app --host 127.0.0.1 --port 8007
+```
+
+Terminal 2 — record data, then verify hybrid evidence and source resolution:
+
+```powershell
+$es = 'http://localhost:9200'
+$api = 'http://127.0.0.1:8007'
+foreach ($index in @('podcast_clips', 'podcast_rag_v1')) {
+  if ((Invoke-RestMethod "$es/$index/_count").count -ne 25) { throw "Unexpected count: $index" }
+}
+$mapping = Invoke-RestMethod "$es/podcast_rag_v1/_mapping"
+if ($mapping.podcast_rag_v1.mappings.properties.embedding.dims -ne 768) { throw 'Wrong dimension' }
+function Get-CorpusSnapshot {
+  $records = foreach ($index in @('podcast_clips', 'podcast_rag_v1')) {
+    $data = Invoke-RestMethod "$es/$index/_search?size=100&seq_no_primary_term=true"
+    foreach ($item in ($data.hits.hits | Sort-Object _id)) {
+      [ordered]@{ index=$index; id=$item._id; seq=$item._seq_no; term=$item._primary_term; source=$item._source }
+    }
+  }
+  ConvertTo-Json -InputObject @($records) -Depth 30 -Compress
+}
+$before = Get-CorpusSnapshot
+Invoke-RestMethod "$api/health"
+Invoke-RestMethod "$api/search?q=machine%20learning"
+foreach ($question in @('What do the speakers say about machine learning?', 'How is AI used?', 'What challenges are discussed?')) {
+  $body = @{question=$question} | ConvertTo-Json
+  $result = Invoke-RestMethod "$api/ask" -Method Post -ContentType 'application/json' -Body $body
+  $result | Select-Object status, retrieval_mode, reason, degraded
+  if ($result.retrieval_mode -ne 'hybrid' -or $result.sources.Count -eq 0) { throw 'Hybrid evidence not returned' }
+  if ($null -ne $result.answer -or $result.reason -ne 'llm_not_configured') { throw 'Expected evidence-only response' }
+  foreach ($source in $result.sources) {
+    $id = [uri]::EscapeDataString($source.chunk_id)
+    $resolved = Invoke-RestMethod "$api/sources/$id"
+    if ($resolved.chunk_id -ne $source.chunk_id -or $resolved.excerpt -ne $source.excerpt) { throw 'Source mismatch' }
+  }
+}
+if ((Get-CorpusSnapshot) -ne $before) { throw 'Corpus changed' }
+```
+
+For a safe fallback test, stop only this test API with Ctrl+C in Terminal 1,
+point it at a nonexistent name, and restart. This does not create/delete an index
+and fails before contacting Gemini:
+
+```powershell
+$env:RAG_VECTOR_INDEX = 'rag-unavailable-' + [guid]::NewGuid().ToString('N')
+.\.venv\Scripts\python.exe -B -m uvicorn api.main:app --host 127.0.0.1 --port 8007
+```
+
+Terminal 2:
+
+```powershell
+$body = @{question='machine learning'} | ConvertTo-Json
+$fallback = Invoke-RestMethod "$api/ask" -Method Post -ContentType 'application/json' -Body $body
+$fallback | Select-Object status, retrieval_mode, degraded, reason
+if ($fallback.retrieval_mode -ne 'bm25' -or -not $fallback.degraded -or $fallback.sources.Count -eq 0) { throw 'Fallback failed' }
+if ((Get-CorpusSnapshot) -ne $before) { throw 'Corpus changed' }
+```
+
+Stop the test API afterwards. Restore `$env:RAG_VECTOR_INDEX='podcast_rag_v1'` and
+`$env:RAG_RETRIEVAL_MODE='bm25'` in Terminal 1 before your next normal startup.
+No data or volume cleanup is required.
+
 ## RAG generation cache (Stage 5)
 
 `RAG_ANSWER_CACHE_TTL_SECONDS=900` enables a 15-minute generation cache using the
@@ -286,7 +411,7 @@ does not invalidate otherwise identical generation.
 
 Set `RAG_ENABLED=true` in the process environment (or use Uvicorn's
 `--env-file .env`) to enable `POST /ask` with `{"question": "..."}`. No LLM or
-embedding credentials are required for retrieval. Without generation settings,
+embedding credentials are required for default BM25 retrieval. Without generation settings,
 retrieval returns `answer: null`, full passages in `sources`,
 `retrieval_mode: "bm25"`, and `status: "generation_unavailable"` with reason
 `llm_not_configured`. An unsupported provider returns `unsupported_provider`.

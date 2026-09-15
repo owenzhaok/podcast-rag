@@ -19,12 +19,22 @@ def create_router(config: RagConfig, get_clients=lambda: (None, None), get_redis
                 question=request.question, status="disabled", reason="rag_disabled",
             )
         started = perf_counter()
+        mode, fallback = "bm25", False
         try:
             es, pool = get_clients()
-            sources = await retrieve(request.question, es, pool, config)
+            if config.retrieval_mode == "hybrid":
+                from api.rag.hybrid import retrieve_hybrid
+                sources, mode, fallback = await retrieve_hybrid(request.question, es, pool, config)
+            else:
+                sources = await retrieve(request.question, es, pool, config)
         except RetrievalUnavailable:
             raise HTTPException(status_code=503, detail="retrieval_unavailable") from None
         response = await generate_answer(request.question, sources, config, provider, get_redis())
+        response.retrieval_mode = mode
+        if fallback:
+            response.degraded = True
+            if response.reason is None:
+                response.reason = "hybrid_retrieval_unavailable"
         response.took_ms = int((perf_counter() - started) * 1000)
         return response
 

@@ -83,17 +83,21 @@ async def enrich(evidence: list[Evidence], pool) -> list[RagSource]:
     return sources
 
 
-async def retrieve(question: str, es, pool, config: RagConfig) -> list[RagSource]:
+async def retrieve_candidates(question: str, es, config: RagConfig) -> list[Evidence]:
     # Preserve legacy query semantics, but never use its highlight as evidence.
     query = build_query(question, 0, config.candidate_limit)
     query.pop("highlight", None)
     query.update({"_source": FIELDS, "sort": [{"_score": "desc"}, *SORT]})
     raw = await search_index(es, config.source_index, query)
-    candidates = [clip for hit in raw["hits"]["hits"] if (clip := parse_hit(hit)) is not None]
+    return [clip for hit in raw["hits"]["hits"] if (clip := parse_hit(hit)) is not None]
+
+
+async def retrieve(question: str, es, pool, config: RagConfig) -> list[RagSource]:
+    candidates = await retrieve_candidates(question, es, config)
     return await enrich(select_context(candidates, config.max_sources, config.context_max_bytes), pool)
 
 
-async def resolve(chunk_id: str, es, pool, config: RagConfig) -> RagSource | None:
+async def resolve_evidence(chunk_id: str, es, config: RagConfig) -> Evidence | None:
     locator = decode_chunk_id(chunk_id)
     if locator is None:
         return None
@@ -113,7 +117,12 @@ async def resolve(chunk_id: str, es, pool, config: RagConfig) -> RagSource | Non
         for hit in hits:
             clip = parse_hit(hit)
             if clip is not None and clip.chunk_id == chunk_id:
-                return (await enrich([clip], pool))[0]
+                return clip
         if len(hits) < 100:
             return None
     raise RetrievalUnavailable()
+
+
+async def resolve(chunk_id: str, es, pool, config: RagConfig) -> RagSource | None:
+    clip = await resolve_evidence(chunk_id, es, config)
+    return (await enrich([clip], pool))[0] if clip is not None else None

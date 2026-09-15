@@ -15,6 +15,9 @@ CACHE_IO_TIMEOUT_SECONDS = 1.0
 
 
 def generation_key(request: GenerationRequest, provider: str) -> str:
+    # Retrieval mode is not a generation input: the actual selected passages,
+    # order, labels, metadata and question are already in request.user. BM25 and
+    # hybrid may safely share only an identical effective generation request.
     identity = {
         "request": asdict(request), "provider": provider,
         "generation_version": GENERATION_VERSION,

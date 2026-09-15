@@ -1,4 +1,4 @@
-"""Versioned retrieval-document convention; no online query embeddings yet."""
+"""Centralized, versioned document and query embedding conventions."""
 
 import os
 
@@ -6,6 +6,12 @@ import psycopg2
 
 
 DOCUMENT_INPUT_VERSION = "gemini-document-v1"
+QUERY_INPUT_VERSION = "gemini-query-v1"
+
+
+def query_input(question: str) -> str:
+    """gemini-query-v1: preserve the exact validated question."""
+    return f"task: question answering | query: {question}"
 
 
 def document_input(document: dict, episode_title: str | None = None) -> str:

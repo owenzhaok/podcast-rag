@@ -10,6 +10,7 @@ def isolate_llm(monkeypatch):
     for name in list(os.environ):
         if name.startswith(("RAG_LLM_", "RAG_EMBEDDING_")) or name in (
             "RAG_CONTEXT_MAX_TOKENS", "RAG_MAX_OUTPUT_TOKENS", "RAG_ANSWER_CACHE_TTL_SECONDS",
+            "RAG_RETRIEVAL_MODE",
         ):
             monkeypatch.delenv(name, raising=False)
 

@@ -52,7 +52,7 @@ export interface AskResponse {
   reason: string | null;
   answer: { paragraphs: AnswerParagraph[] } | null;
   sources: RagSource[];
-  retrieval_mode: 'bm25' | null;
+  retrieval_mode: 'bm25' | 'hybrid' | null;
   degraded: boolean;
   cached: boolean;
   took_ms: number;

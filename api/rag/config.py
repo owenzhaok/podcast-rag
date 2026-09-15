@@ -3,6 +3,7 @@
 import os
 import re
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,7 @@ class RagConfig:
     max_output_tokens: int = 800
     llm_timeout_seconds: int = 20
     answer_cache_ttl_seconds: int = 900
+    retrieval_mode: Literal["bm25", "hybrid"] = "bm25"
 
     @staticmethod
     def _cache_ttl() -> int:
@@ -50,7 +52,9 @@ class RagConfig:
         index = os.environ.get("RAG_SOURCE_INDEX", "podcast_clips")
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,254}", index):
             index = "podcast_clips"
+        mode = os.environ.get("RAG_RETRIEVAL_MODE", "bm25").strip().lower()
         return cls(
+            retrieval_mode="hybrid" if mode == "hybrid" else "bm25",
             enabled=enabled, llm_configured=configured, source_index=index,
             candidate_limit=cls._bounded_int("RAG_CANDIDATE_LIMIT", 30, 200),
             max_sources=cls._bounded_int("RAG_MAX_SOURCES", 6, 20),

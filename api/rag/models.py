@@ -52,7 +52,7 @@ class AskResponse(BaseModel):
     reason: str | None = None
     answer: Answer | None = None
     sources: list[RagSource] = Field(default_factory=list)
-    retrieval_mode: Literal["bm25"] | None = None
+    retrieval_mode: Literal["bm25", "hybrid"] | None = None
     degraded: bool = False
     cached: bool = False
     took_ms: int = 0
