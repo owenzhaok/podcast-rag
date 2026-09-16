@@ -1,976 +1,190 @@
-# Podcast Search
+# Podcast RAG
 
-## Small real Spotify source sample (Stage 8.5A)
+Search podcast transcripts and ask questions with answers linked to the passages that support them. Podcast RAG combines a React/TypeScript interface, FastAPI, Elasticsearch BM25 and optional Gemini vector retrieval, with Groq generating cited answers from selected evidence. A small real-data evaluation compares retrieval quality and latency across the same corpus and judgments, rather than relying on demo answers alone.
 
-`python -m ingest.spotify_sample` streams transcript JSON directly from the nested
-ZIP/tar.gz dataset. It does not extract tarballs, run ingestion on API startup,
-create vectors, or change the synthetic workflow or active `/ask` source index.
-The default write target is **podcast_clips_real_v1**. Only concrete index names
-beginning `podcast_clips_real_` are accepted. Aliases, wildcard targets, existing
-indexes with incompatible mappings/provenance, and the synthetic/vector indexes
-are refused. There is no delete/recreate option.
+## Highlights
 
-Sampling follows the existing tar member order, starts with
-`podcasts-transcripts-0to2.tar.gz`, accepts English metadata (`en`, `['en']`, etc.),
-and takes at most `--max-per-show 5` episodes per show. It stops reading transcripts
-as soon as `--episodes N` usable episodes have been accepted. Non-English/missing
-metadata, unreadable transcripts and empty clips do not consume accepted slots.
-This is reproducible for the same archive/metadata and options, not random or
-representative sampling. If the shard is exhausted first, the CLI reports
-`sample_complete=false` and exits 1. An operational failure exits 2; diagnostics
-never print raw dataset/provider/database error bodies.
-
-The metadata TSV is read once into an automatically cleaned temporary SQLite
-lookup, including English rows only. This uses temporary disk space proportional
-to metadata size, not RAM proportional to the dataset. Transcript memory is
-bounded to one episode: at most 16 MiB JSON and 50000 retained words (100000 input
-word entries allowing a repeated final aggregate), with timestamps bounded to
-24 hours. Python's retained tar-header history is cleared as the scan proceeds.
-No member is extracted to a filesystem path. Progress is counts only.
-
-Parsing uses `alternatives[0].words`, exact decimal seconds converted to integer
-milliseconds, and the existing `WordRecord` and `segment()` helper. It preserves
-word order, zero-duration ASR words and speaker tags (missing tags default to 0).
-An exact repeated final diarized aggregate replaces the preceding word sequence,
-matching the existing parser's canonical convention without duplicating words;
-otherwise result segments are concatenated. Invalid word records are skipped and
-counted. Backwards timestamp ordering is counted separately and preserved, not
-silently sorted. Missing/empty result entries are counted even when a valid final
-aggregate allows the episode to be used. `malformed_transcripts` therefore includes
-partially usable episodes, not just rejected files.
-
-Clips use the existing default 120-second windows/60-second overlap, actual
-first/last word endpoints and lexical mapping. The CLI also honors existing
-`CLIP_DURATION_DEFAULT`/`CLIP_OVERLAP`, or explicit window arguments. Documents keep
-`podcast_id`, `episode_id`, `clip_index`, `clip_start_ms`, `clip_end_ms`, `clip_text`,
-`word_timestamps` and `speakers`. Additive keyword provenance includes Stage 2
-`chunk_id`, show/episode filename prefixes and URIs, dataset identifier
-`spotify-podcasts-2020`, archive/member names and chunking version. Filename prefixes
-remain available for later compliance/retraction handling. Elasticsearch IDs are
-SHA-256 of the existing stable chunk ID, compatible with vector preparation.
-
-Only selected episodes' metadata is inserted into the existing PostgreSQL
-`shows`/`episodes` tables, using filename prefixes as IDs and the existing columns.
-Titles therefore work with normal enrichment and future Gemini document inputs.
-Existing metadata is never overwritten: matching rows are reused, conflicts stop
-the run and roll back that episode's metadata transaction. This protects the
-synthetic metadata path. PostgreSQL must be available for write runs. Metadata
-commits before an episode's Elasticsearch writes; a failed write can leave metadata
-or a partial episode, and rerunning fills the missing chunks.
-
-Chunks use create-only writes; existing deterministic IDs count as `chunks_existing`
-(HTTP 409), not duplicates. Resume by repeating the same command. The index records
-archive/metadata ZIP CRCs, parser version, language, show cap and window settings;
-changing these requires a new versioned real index. CRCs identify the supplied
-archive, not cryptographically authenticate it; use one importer per target.
-Increasing `--episodes 20` to `--episodes 100` extends the same deterministic sample.
-Reducing the limit does **not** remove previously ingested episodes. For a separate
-sample use a fresh name such as `podcast_clips_real_v2`; nothing is automatically
-deleted. Resume scans again from the archive start rather than seeking within gzip.
-`chunks_produced` counts windows before logical deduplication; identical windows
-share an ID, so the stored document count can be smaller than that counter.
-
-### Stage 8.5A PowerShell validation
-
-Keep the original dataset outside the repository. Do not commit real transcripts,
-metadata rows, extracted files or evaluation results. Tests create tiny synthetic
-archives dynamically. No real write run is required to run the tests.
-
-```powershell
-$dataset = 'D:\Datasets\podcast-rag\raw\podcasts-no-audio-13GB.zip'
-$es = 'http://localhost:9200'
-$sourceBefore = (Invoke-RestMethod "$es/podcast_clips/_count").count
-$vectorBefore = (Invoke-RestMethod "$es/podcast_rag_v1/_count").count
-
-# Parse, join and chunk 20 episodes; no Elasticsearch/PostgreSQL connections.
-.\.venv\Scripts\python.exe -B -m ingest.spotify_sample --zip $dataset --episodes 20 --max-per-show 5 --clip-duration 120 --overlap 60 --dry-run
-if ($LASTEXITCODE -ne 0) { throw 'Dry run incomplete or failed' }
-
-# Existing ES_HOST/POSTGRES_DSN environment settings are reused, with the same
-# localhost defaults as the backend. Do not print connection credentials.
-.\.venv\Scripts\python.exe -B -m ingest.spotify_sample --zip $dataset --episodes 20 --max-per-show 5 --clip-duration 120 --overlap 60 --index podcast_clips_real_v1
-if ($LASTEXITCODE -ne 0) { throw 'Ingestion stopped; check services/target/metadata conflicts before resuming' }
-
-# Refresh only the new real index so counts are immediately visible.
-Invoke-RestMethod "$es/podcast_clips_real_v1/_refresh" -Method Post | Out-Null
-Invoke-RestMethod "$es/podcast_clips_real_v1/_count"
-Invoke-RestMethod "$es/podcast_clips_real_v1/_mapping"
-$body = @{size=3; _source=@('chunk_id','podcast_id','episode_id','show_filename_prefix','episode_filename_prefix','episode_uri','clip_start_ms','clip_end_ms','source_dataset','source_archive')} | ConvertTo-Json -Depth 5
-$sample = Invoke-RestMethod "$es/podcast_clips_real_v1/_search" -Method Post -ContentType 'application/json' -Body $body
-$sample.hits.hits | ForEach-Object { $_._source } | Format-List
-
-# Same command resumes/idempotently verifies the sample: expect chunks_written=0.
-.\.venv\Scripts\python.exe -B -m ingest.spotify_sample --zip $dataset --episodes 20 --max-per-show 5 --clip-duration 120 --overlap 60 --index podcast_clips_real_v1
-if ($LASTEXITCODE -ne 0) { throw 'Repeat ingestion failed' }
-if ((Invoke-RestMethod "$es/podcast_clips/_count").count -ne $sourceBefore) { throw 'Synthetic source count changed' }
-if ((Invoke-RestMethod "$es/podcast_rag_v1/_count").count -ne $vectorBefore) { throw 'Synthetic vector count changed' }
-```
-
-Inspect transcript text locally only when needed by adding `clip_text` to the
-sample request; do not save it as a test fixture or paste it into committed reports.
-No RAG settings need changing. Real vectors and subsequent workflow stages are
-outside Stage 8.5A.
-
-## Offline retrieval evaluation (Stage 8)
-
-Run `python -m api.rag.evaluate --dataset <file> --mode bm25|hybrid|both
---output .local-eval/report.json`. Both CLI and server defaults remain BM25;
-`RAG_RETRIEVAL_MODE=bm25` is unchanged. The explicit CLI mode does not change the
-server environment. No API server, Groq, generation cache or PostgreSQL is needed.
-Hybrid alone uses your server/local Gemini configuration and may incur Gemini
-charges. Normal tests use deterministic doubles, never real provider calls.
-
-Datasets are UTF-8 JSON arrays (or one object), or `.jsonl` with one object per
-nonblank line. Example (replace these illustrative IDs with reviewed corpus IDs):
-
-```json
-[
-  {"query":"What are the benefits of machine learning?","relevant_chunk_ids":["<chunk ID 1>","<chunk ID 2>"],"notes":"Human-reviewed binary judgments"}
-]
-```
-
-`query` is a nonblank string, at most 2000 characters, trimmed as in `/ask`.
-`relevant_chunk_ids` is a required list of stable Stage 2 IDs, not `S1` labels or
-Elasticsearch document IDs. `notes` is an optional string. Unknown fields and
-malformed records fail validation. Limits: 5 MiB, 10000 queries, 10000 relevance
-IDs per query. Duplicate relevant IDs are collapsed. The committed two-row
-`api/tests/fixtures/retrieval_smoke.jsonl` is for test doubles only, not production
-evaluation. Judge relevance independently; do not use a retriever's own results
-as ground truth. Each row has equal weight, including repeated questions.
-
-Metrics use binary relevance and the **final selected source list**, after RRF
-(if enabled), deduplication, overlap suppression, source count and evidence-byte
-limits. They precede generation's model-context budgeting. Duplicate retrieved
-IDs are removed while preserving first occurrence and compressing ranks.
-
-- Hit Rate@1/@3/@5: fraction of queries with at least one relevant result in top k.
-- Recall@1/@3/@5: macro average of unique relevant hits in top k divided by all
-  judged relevant IDs for that query; multiple relevant IDs affect the denominator.
-- MRR: macro average of reciprocal rank of the first relevant result in the entire
-  returned list (bounded by `RAG_MAX_SOURCES`, normally six); zero if none is found.
-- nDCG@5: binary DCG uses `1/log2(rank+1)` for each relevant result, divided by the
-  ideal DCG for `min(5, number of relevant IDs)` relevant results.
-- Mean/median latency: milliseconds for each retrieval attempt, including Gemini
-  query embedding, kNN, source hydration and selection; excluding connection setup,
-  PostgreSQL metadata lookup, generation and report writing. No warmup or retries.
-
-Empty results score zero. Queries explicitly labeled with no relevant IDs score
-zero for all relevance metrics and remain in macro averages. Fewer-than-k results
-are used as returned; recall is not rescaled to list length. Infrastructure errors
-also score as empty retrieval and are counted separately rather than dropped.
-The CLI saves the report then exits 1 if any retrieval failed; startup/input/output
-errors exit 2. Hybrid fallback with working BM25 is a successful evaluation attempt.
-
-Hybrid summaries report successful hybrid count/rate and BM25 fallback count/rate,
-using **all attempted queries** as denominator. Actual BM25 results include both
-vector failures and no usable vector candidates; `vector_failure_count` and
-`no_usable_vector_count` distinguish them. Retrieval errors are neither hybrid
-successes nor BM25 fallbacks. Scores for hybrid include its fallbacks, reflecting
-the behavior users receive. Do not present those scores as vector-only performance.
-
-Console output summarizes scores and fallback counts. JSON contains per-query
-numbers, judged/retrieved IDs, metrics, actual mode, safe errors, timings, aggregate
-scores, dataset fingerprint, candidate limits, RRF k, source/embedding configuration,
-and query/document format versions. It omits query text, notes, transcripts, API
-keys, connection URLs and LLM settings. The fingerprint hashes normalized queries
-and sorted relevance sets in dataset order (notes excluded). Keep keys out of all
-dataset and configuration identifiers. Reports go in gitignored `.local-eval/`.
-
-`both` uses the same dataset/configuration, processing each query with BM25 then
-Hybrid. Existing caches and index warmth can influence timing; this is not a
-load benchmark. Record a fixed corpus and identical selection limits for comparisons.
-The current 25 synthetic clips support **functional evaluation only**. No result
-from this smoke corpus establishes that Hybrid is better, and no default switch
-is recommended. Stage 9 is not implemented.
-
-### Manual Stage 8 validation (PowerShell)
-
-Run from the repository root, with the existing Gemini key present only in your
-local environment. These commands use real Gemini for the Hybrid run, never Groq.
-Do not perform ingestion/backfill concurrently with this comparison.
-
-```powershell
-$es = 'http://localhost:9200'
-foreach ($index in @('podcast_clips', 'podcast_rag_v1')) {
-  if ((Invoke-RestMethod "$es/$index/_count").count -ne 25) { throw "Unexpected count: $index" }
-}
-function Get-EvalSnapshot {
-  $records = foreach ($index in @('podcast_clips', 'podcast_rag_v1')) {
-    $mapping = Invoke-RestMethod "$es/$index/_mapping"
-    $settings = Invoke-RestMethod "$es/$index/_settings"
-    $data = Invoke-RestMethod "$es/$index/_search?size=100&seq_no_primary_term=true"
-    [ordered]@{index=$index; mapping=$mapping; settings=$settings; documents=@($data.hits.hits | Sort-Object _id)}
-  }
-  ConvertTo-Json -InputObject @($records) -Depth 40 -Compress
-}
-$before = Get-EvalSnapshot
-New-Item -ItemType Directory -Force '.local-eval' | Out-Null
-$env:ES_HOST = $es
-$env:RAG_SOURCE_INDEX = 'podcast_clips'
-$env:RAG_VECTOR_INDEX = 'podcast_rag_v1'
-$env:RAG_RETRIEVAL_MODE = 'bm25'
-$env:RAG_CANDIDATE_LIMIT = '30'
-$env:RAG_MAX_SOURCES = '6'
-$env:RAG_CONTEXT_MAX_BYTES = '16000'
-```
-
-Prepare `.local-eval/queries.jsonl` with independently reviewed questions and chunk
-IDs. This read-only command lists canonical IDs, episode IDs and timestamps to help
-identify clips; consult their canonical transcripts when assigning relevance:
-
-```powershell
-.\.venv\Scripts\python.exe -B -c "from elasticsearch import Elasticsearch; from api.rag.retrieval import parse_hit; import json,os; es=Elasticsearch(os.environ['ES_HOST']); hits=es.search(index='podcast_clips',size=100)['hits']['hits']; print(json.dumps([{'chunk_id':c.chunk_id,'episode_id':c.episode_id,'start_ms':c.start_ms} for h in hits if (c:=parse_hit(h))],indent=2)); es.close()"
-# Repeat this block for each independently judged question. Enter one or more
-# relevant IDs separated by commas; leave empty only for explicitly unanswerable queries.
-$question = Read-Host 'Enter an independently judged question'
-$ids = Read-Host 'Enter reviewed relevant chunk IDs, comma-separated'
-$judgment = @{query=$question; relevant_chunk_ids=@($ids.Split(',') | ForEach-Object {$_.Trim()} | Where-Object {$_}); notes='Human-reviewed functional smoke judgment'}
-$judgment | ConvertTo-Json -Compress | Add-Content -Encoding UTF8 '.local-eval/queries.jsonl'
-
-.\.venv\Scripts\python.exe -B -m api.rag.evaluate --dataset .local-eval/queries.jsonl --mode bm25 --output .local-eval/bm25.json
-if ($LASTEXITCODE -ne 0) { throw 'BM25 evaluation failed; inspect safe report errors' }
-
-if (-not $env:RAG_EMBEDDING_API_KEY) { throw 'Existing local Gemini key is required; do not print it' }
-$env:RAG_EMBEDDING_PROVIDER = 'gemini'
-$env:RAG_EMBEDDING_MODEL = 'gemini-embedding-2'
-$env:RAG_EMBEDDING_DIMENSIONS = '768'
-$env:RAG_EMBEDDING_REVISION = 'v1'
-$env:RAG_EMBEDDING_TIMEOUT_SECONDS = '20'
-.\.venv\Scripts\python.exe -B -m api.rag.evaluate --dataset .local-eval/queries.jsonl --mode hybrid --output .local-eval/hybrid.json
-if ($LASTEXITCODE -ne 0) { throw 'Hybrid evaluation failed; inspect safe report errors' }
-
-$bm = Get-Content .local-eval/bm25.json -Raw | ConvertFrom-Json
-$hy = Get-Content .local-eval/hybrid.json -Raw | ConvertFrom-Json
-if ($bm.dataset_sha256 -ne $hy.dataset_sha256) { throw 'Different judgments; do not compare' }
-'functional evaluation only'
-$comparison = foreach ($metric in $bm.runs.bm25.summary.metrics.PSObject.Properties.Name) {
-  [pscustomobject]@{Metric=$metric; BM25=$bm.runs.bm25.summary.metrics.$metric; Hybrid=$hy.runs.hybrid.summary.metrics.$metric}
-}
-$comparison | Format-Table
-$hy.runs.hybrid.summary | Select-Object successful_hybrid_count, successful_hybrid_rate, bm25_fallback_count, bm25_fallback_rate, vector_failure_count, no_usable_vector_count, error_count
-if ((Get-EvalSnapshot) -ne $before) { throw 'Elasticsearch indices changed during evaluation' }
-foreach ($index in @('podcast_clips', 'podcast_rag_v1')) {
-  if ((Invoke-RestMethod "$es/$index/_count").count -ne 25) { throw "Unexpected count: $index" }
-}
-git check-ignore .local-eval/bm25.json .local-eval/hybrid.json
-```
-
-For a single combined run, use `--mode both --output .local-eval/both.json` instead
-of the two separate runs. This makes additional Gemini calls; it is not necessary
-after the comparison above. Keep `RAG_RETRIEVAL_MODE=bm25` unchanged.
-
-## Optional vector preparation (Stages 6 / 6.5)
-
-Stage 6 is offline preparation only. `/search` is unchanged; `/ask` still uses
-BM25, the Stage 5 generation cache, and Groq. No vector configuration is loaded by
-API startup and no vector state is added to the active generation-cache identity.
-Stage 7 optionally enables hybrid retrieval as documented below; BM25 remains default.
-
-The companion index defaults to `RAG_VECTOR_INDEX=podcast_rag_v1`. It uses a strict
-mapping with an indexed float `dense_vector`, explicit dimensions, cosine
-similarity, and HNSW. It stores the exact Stage 2 `chunk_id`, show/episode IDs,
-timestamps, exact `chunk_text`, content hash, speakers, source index, provider,
-model, revision, and chunking version. Legacy Elasticsearch document IDs are not
-needed: duplicates share the same stable provenance. The vector document `_id`
-is SHA-256 of the existing Stage 2 `chunk_id` (to respect Elasticsearch's 512-byte
-ID limit); the original chunk ID remains available in the document.
-
-`RAG_EMBEDDING_PROVIDER`, `RAG_EMBEDDING_MODEL`, and `RAG_EMBEDDING_DIMENSIONS` must
-be explicitly configured for the tool. Batch size defaults to 32 (1–200), revision
-to `v1`. Fake dimensions may be 1–4096; Gemini is configured for exactly 768.
-The `fake` provider's deterministic normalized vectors test plumbing, **not semantic
-similarity**. Stage 6.5 also supports `gemini` / `gemini-embedding-2` through HTTPX,
-without a new SDK or dependency. Never put keys in model/revision identifiers or
-commit credentials. Real Gemini usage may incur provider charges.
-
-Commands use the process environment and existing `ES_HOST`/`RAG_SOURCE_INDEX`:
-
-```powershell
-.\.venv\Scripts\python.exe -B -m api.rag.backfill create
-.\.venv\Scripts\python.exe -B -m api.rag.backfill check
-.\.venv\Scripts\python.exe -B -m api.rag.backfill backfill --limit 10
-```
-
-Creation is explicit and idempotent. Backfill requires an existing compatible
-index and an explicit positive scan limit; it never creates/recreates indexes.
-Concrete index names only: aliases, wildcard targets, and equal source/vector
-names are rejected. Incompatible mappings/dimensions stop safely. Do not create
-fake vectors in a companion index intended for real semantic retrieval.
-
-Backfill scans source clips in bounded batches using a scroll snapshot, validates
-whole embedding batches before writing, and upserts deterministic IDs. It checks
-existing documents in real time, skipping matching content/provenance and
-provider/model/revision/chunking version with valid vectors. Progress logs contain
-only scanned/written/skipped counts. Source clips over 256 KiB or invalid clips
-stop the run. Previously completed batches survive a failure; a bulk-write failure
-can leave part of its batch complete, and rerunning safely fills the remainder.
-No global in-memory deduplication set or automatic startup work is used.
-
-Changed exact transcript content has a new identity and creates a new document;
-old identities are retained, never silently deleted. Revision changes re-embed
-existing identities. Gemini refuses an index containing fake or different-model
-vectors: provider/model/dimension migrations require a new versioned index.
-Fake-only Stage 6 model-change tests retain their existing behavior.
-Run one backfill per target at a time; after interruption or
-a model change, finish a full intended scan before using that index in future
-retrieval. A limited rerun begins from the start and is not a persistent cursor.
-
-### Safe manual Stage 6 validation (PowerShell)
-
-Run from the repository root with existing Docker services running. This creates
-only two uniquely named tiny test indexes; it does not write `podcast_clips`, touch
-backups, or delete any data. It intentionally uses a test companion name rather
-than populating the production default with fake vectors.
-
-```powershell
-$es = 'http://localhost:9200'
-$originalCount = (Invoke-RestMethod "$es/podcast_clips/_count").count
-$suffix = [guid]::NewGuid().ToString('N')
-$env:RAG_SOURCE_INDEX = "rag-stage6-source-$suffix"
-$env:RAG_VECTOR_INDEX = "podcast_rag_v1_smoke_$suffix"
-$env:RAG_EMBEDDING_PROVIDER = 'fake'
-$env:RAG_EMBEDDING_MODEL = 'fake-smoke'
-$env:RAG_EMBEDDING_DIMENSIONS = '8'
-$env:RAG_EMBEDDING_BATCH_SIZE = '2'
-$env:RAG_EMBEDDING_REVISION = 'v1'
-$sourceUrl = "$es/$env:RAG_SOURCE_INDEX"
-$vectorUrl = "$es/$env:RAG_VECTOR_INDEX"
-Invoke-RestMethod -Method Put -Uri $sourceUrl -ContentType 'application/json' `
-  -Body '{"settings":{"number_of_shards":1,"number_of_replicas":0}}'
-$doc = @{podcast_id='demo-show'; episode_id='demo-episode'; clip_index=0;
-  clip_start_ms=0; clip_end_ms=120000; speakers=@(1);
-  clip_text='Machine learning identifies patterns in research.'} | ConvertTo-Json
-Invoke-RestMethod -Method Put -Uri "$sourceUrl/_doc/one?refresh=true" `
-  -ContentType 'application/json' -Body $doc
-Invoke-RestMethod -Method Put -Uri "$sourceUrl/_doc/duplicate?refresh=true" `
-  -ContentType 'application/json' -Body $doc
-$beforeSource = Invoke-RestMethod "$sourceUrl/_search?size=10"
-.\.venv\Scripts\python.exe -B -m api.rag.backfill create
-.\.venv\Scripts\python.exe -B -m api.rag.backfill check
-.\.venv\Scripts\python.exe -B -m api.rag.backfill backfill --limit 10
-Invoke-RestMethod -Method Post "$vectorUrl/_refresh"
-$first = Invoke-RestMethod "$vectorUrl/_search?size=10"
-.\.venv\Scripts\python.exe -B -m api.rag.backfill backfill --limit 10
-Invoke-RestMethod -Method Post "$vectorUrl/_refresh"
-$second = Invoke-RestMethod "$vectorUrl/_search?size=10"
-if ($first.hits.total.value -ne 1 -or $second.hits.total.value -ne 1) { throw 'Count mismatch' }
-if ($first.hits.hits[0]._id -ne $second.hits.hits[0]._id) { throw 'ID changed' }
-if ($second.hits.hits[0]._source.embedding.Count -ne 8) { throw 'Wrong dimension' }
-Invoke-RestMethod "$vectorUrl/_mapping" | ConvertTo-Json -Depth 15
-$afterSource = Invoke-RestMethod "$sourceUrl/_search?size=10"
-$before = $beforeSource.hits.hits | Sort-Object _id | ConvertTo-Json -Depth 15 -Compress
-$after = $afterSource.hits.hits | Sort-Object _id | ConvertTo-Json -Depth 15 -Compress
-if ($before -ne $after) { throw 'Test source changed' }
-if ((Invoke-RestMethod "$es/podcast_clips/_count").count -ne $originalCount) { throw 'Corpus count changed' }
-# Leave the tiny test indexes intact for inspection; no deletion commands.
-# Reset source selection before starting any API in this shell.
-$env:RAG_SOURCE_INDEX = 'podcast_clips'
-```
-
-Expected backfill summaries: first `written=1`, second `written=0`, both
-`scanned=2`. To verify BM25 without a Groq call, start an evidence-only API on a
-separate port (keep existing application processes unchanged):
-
-```powershell
-$env:RAG_ENABLED = 'true'
-$env:RAG_LLM_PROVIDER = ''
-.\.venv\Scripts\python.exe -B -m uvicorn api.main:app --host 127.0.0.1 --port 8001
-```
-
-In another PowerShell window:
-
-```powershell
-$result = Invoke-RestMethod -Method Post 'http://localhost:8001/ask' `
-  -ContentType 'application/json' -Body '{"question":"machine learning"}'
-$result | Select-Object status, reason, retrieval_mode
-if ($result.retrieval_mode -ne 'bm25') { throw 'Unexpected retrieval mode' }
-```
-
-Stop the temporary API with Ctrl+C. The opt-in automated integration test uses
-temporary indices and fake vectors, checks kNN queryability and source integrity,
-and cleans up only its own unique indices:
-
-```powershell
-$env:RAG_INTEGRATION_TESTS = '1'
-.\.venv\Scripts\python.exe -B -m pytest api/tests/test_vector_preparation.py -q
-```
-
-### Gemini preparation (Stage 6.5): manual live validation
-
-The adapter sends `POST .../models/<configured-model>:embedContent`, with the key
-only in `x-goog-api-key`, and requests `outputDimensionality=768`. See the
-[Gemini embedding REST documentation](https://ai.google.dev/gemini-api/docs/embeddings).
-It makes sequential requests inside each existing backfill batch, validates all
-vectors before writing that batch, and performs no automatic retries. The timeout
-is `RAG_EMBEDDING_TIMEOUT_SECONDS=20` per HTTP operation. Responses are bounded to
-128 KiB; HTTP/network errors contain only safe reasons, never provider bodies.
-The scroll lease is 30 minutes to accommodate sequential requests. Use small
-batches during initial validation; complete previous batches survive failures.
-
-Gemini's canonical input is `title: <episode title> | text: <exact transcript>`.
-The CLI reads episode titles from PostgreSQL in a bounded read-only batch lookup;
-missing/unavailable metadata uses `<podcast_id>/<episode_id>` as the title.
-`gemini-document-v1` and the SHA-256 of this exact input are stored alongside the
-unchanged Stage 2 identity. Title changes therefore invalidate skip eligibility.
-Changing formatting requires a format-version and embedding-revision bump.
-Do not reuse a revision with a different format; preflight rejects this case.
-Fake providers retain the Stage 6 raw-transcript convention. Stage 6.5 preparation
-does not itself activate hybrid retrieval. To avoid silent truncation, canonical Gemini inputs above 8192
-UTF-8 bytes stop rather than being shortened; this is a conservative token proxy.
-
-Use your existing `RAG_EMBEDDING_API_KEY` environment variable. Do not paste it
-into commands, source files, examples, or output. These commands make **real**
-Gemini requests only when you run them manually. Automated tests never do.
-
-**Phase A — two duplicate sample clips, one real vector:**
-
-```powershell
-if (-not $env:RAG_EMBEDDING_API_KEY) { throw 'Configure the key privately in the local environment first' }
-$es = 'http://localhost:9200'
-$env:RAG_EMBEDDING_PROVIDER = 'gemini'
-$env:RAG_EMBEDDING_MODEL = 'gemini-embedding-2'
-$env:RAG_EMBEDDING_DIMENSIONS = '768'
-$env:RAG_EMBEDDING_REVISION = 'v1'
-$env:RAG_EMBEDDING_BATCH_SIZE = '2'
-$env:RAG_EMBEDDING_TIMEOUT_SECONDS = '20'
-$suffix = [guid]::NewGuid().ToString('N')
-$env:RAG_SOURCE_INDEX = "rag-gemini-source-$suffix"
-$env:RAG_VECTOR_INDEX = "rag-gemini-vector-$suffix"
-$sourceUrl = "$es/$env:RAG_SOURCE_INDEX"
-$vectorUrl = "$es/$env:RAG_VECTOR_INDEX"
-function Invoke-VectorTool([string]$Action, [int]$Limit = 0) {
-  if ($Action -eq 'backfill') {
-    & .\.venv\Scripts\python.exe -B -m api.rag.backfill backfill --limit $Limit
-  } else {
-    & .\.venv\Scripts\python.exe -B -m api.rag.backfill $Action
-  }
-  if ($LASTEXITCODE -ne 0) { throw 'Vector tool failed; stop and inspect the safe error' }
-}
-Invoke-RestMethod -Method Put $sourceUrl -ContentType 'application/json' `
-  -Body '{"settings":{"number_of_shards":1,"number_of_replicas":0}}'
-$sample = @{podcast_id='gemini-demo'; episode_id='gemini-demo-episode'; clip_index=0;
-  clip_start_ms=0; clip_end_ms=120000; speakers=@(1);
-  clip_text='Machine learning identifies patterns in research.'} | ConvertTo-Json
-foreach ($id in @('one','duplicate')) {
-  Invoke-RestMethod -Method Put "$sourceUrl/_doc/${id}?refresh=true" `
-    -ContentType 'application/json' -Body $sample
-}
-Invoke-VectorTool create
-Invoke-VectorTool check
-Invoke-VectorTool backfill 10
-Invoke-RestMethod -Method Post "$vectorUrl/_refresh"
-$first = Invoke-RestMethod "$vectorUrl/_search?size=100"
-if ($first.hits.total.value -ne 1) { throw 'Expected one unique vector' }
-if ($first.hits.hits[0]._source.embedding.Count -ne 768) { throw 'Wrong dimension' }
-Invoke-VectorTool backfill 10 # Must report written=0.
-Invoke-RestMethod -Method Post "$vectorUrl/_refresh"
-$second = Invoke-RestMethod "$vectorUrl/_search?size=100"
-if ($second.hits.total.value -ne 1 -or $first.hits.hits[0]._id -ne $second.hits.hits[0]._id) { throw 'Idempotence failed' }
-$phaseAPassed = $true
-```
-
-**Phase B — only after Phase A succeeds:**
-
-```powershell
-if (-not $phaseAPassed) { throw 'Finish Phase A first' }
-$env:RAG_SOURCE_INDEX = 'podcast_clips'
-$env:RAG_VECTOR_INDEX = 'podcast_rag_v1'
-$vectorUrl = "$es/$env:RAG_VECTOR_INDEX"
-$originalCount = (Invoke-RestMethod "$es/podcast_clips/_count").count
-if ($originalCount -ne 25) { throw 'Corpus changed; review the intended scan limit first' }
-$original = Invoke-RestMethod "$es/podcast_clips/_search?size=100"
-$originalMapping = Invoke-RestMethod "$es/podcast_clips/_mapping"
-# Compute expected UNIQUE stable IDs, not the number of possibly duplicated source clips.
-$expected = & .\.venv\Scripts\python.exe -B -c 'from elasticsearch import Elasticsearch; from api.rag.retrieval import parse_hit; es=Elasticsearch("http://localhost:9200"); hits=es.search(index="podcast_clips",size=100)["hits"]["hits"]; clips=[parse_hit(h) for h in hits]; assert all(clips); print(len({c.chunk_id for c in clips})); es.close()'
-if ($LASTEXITCODE -ne 0) { throw 'Expected identity count failed' }
-Invoke-VectorTool create # Creates only if absent; otherwise checks without recreation.
-Invoke-VectorTool check  # Rejects incompatible mapping, fake/other models, or old format.
-# If either fails, STOP. Use a new versioned index after review; never delete the old index.
-Invoke-VectorTool backfill 25
-Invoke-RestMethod -Method Post "$vectorUrl/_refresh"
-$vectors = Invoke-RestMethod "$vectorUrl/_search?size=100"
-if ($vectors.hits.total.value -ne [int]$expected) { throw 'Unexpected vector count; investigate without deleting data' }
-foreach ($hit in $vectors.hits.hits) {
-  $doc = $hit._source
-  if ($doc.embedding.Count -ne 768 -or $doc.embedding_provider -ne 'gemini' -or
-      $doc.embedding_model -ne 'gemini-embedding-2' -or $doc.embedding_revision -ne 'v1') {
-    throw 'Vector metadata mismatch'
-  }
-}
-Invoke-VectorTool backfill 25 # Must report written=0.
-Invoke-RestMethod -Method Post "$vectorUrl/_refresh"
-$again = Invoke-RestMethod "$vectorUrl/_search?size=100"
-if (($vectors.hits.hits._id | Sort-Object | ConvertTo-Json) -ne
-    ($again.hits.hits._id | Sort-Object | ConvertTo-Json)) { throw 'Vector IDs changed' }
-$after = Invoke-RestMethod "$es/podcast_clips/_search?size=100"
-if (($original.hits.hits | Sort-Object _id | ConvertTo-Json -Depth 30 -Compress) -ne
-    ($after.hits.hits | Sort-Object _id | ConvertTo-Json -Depth 30 -Compress)) { throw 'Source changed' }
-if ((Invoke-RestMethod "$es/podcast_clips/_count").count -ne $originalCount) { throw 'Source count changed' }
-if (($originalMapping | ConvertTo-Json -Depth 30 -Compress) -ne
-    ((Invoke-RestMethod "$es/podcast_clips/_mapping") | ConvertTo-Json -Depth 30 -Compress)) { throw 'Source mapping changed' }
-```
-
-Use the evidence-only API on port 8001 described above to check `/ask` still
-reports `retrieval_mode=bm25`, without invoking Groq. No commands delete indices,
-Docker volumes, or the retained Elasticsearch backup. The Phase A indices remain
-available for inspection. Do not use fake embeddings in the production companion.
-
-## Optional hybrid retrieval (Stage 7)
-
-`RAG_RETRIEVAL_MODE=bm25` remains the default. Only `hybrid` opts into Gemini query
-embeddings, Elasticsearch kNN and application-side Reciprocal Rank Fusion (RRF).
-Unknown mode values safely select BM25. `/search` and its cache are unchanged.
-BM25 startup and retrieval need no Gemini key, vector index or embedding settings.
-
-Hybrid uses the existing `gemini` / `gemini-embedding-2` adapter, exactly 768
-dimensions, `RAG_EMBEDDING_REVISION=v1`, and `podcast_rag_v1` by default. The query
-convention is **gemini-query-v1**: `task: question answering | query: <exact user question>`.
-The **gemini-document-v1** preparation format is unchanged. Credentials stay on
-the server; no browser provider requests, backfills, index refreshes or writes occur.
-
-BM25 requests `RAG_CANDIDATE_LIMIT` (default 30) candidates; vector retrieval takes
-30 with `num_candidates=100`. kNN filters provider, model, revision, input format,
-chunking version and source index. The vector mapping is checked before embedding.
-Vector hits must resolve to the same exact text/hash in the canonical source index;
-missing, stale or mismatching hits are discarded. Metadata comes from PostgreSQL.
-Each unique chunk contributes `1 / (60 + rank)` per list, with ranks starting at
-one after duplicate removal. Contributions are summed by stable Stage 2 chunk ID;
-ties use chunk ID. Existing overlap suppression, source counts, evidence-byte
-limits and generation context budgets apply after fusion.
-
-Failures in Gemini, configuration, vector mapping, kNN or canonical hydration
-fail open to BM25 with `retrieval_mode="bm25"` and `degraded=true`. A successful
-answer in that case has safe reason `hybrid_retrieval_unavailable`; existing
-generation/no-evidence reasons take precedence. No usable vector hits also leaves
-the BM25 order/mode unchanged, without marking an otherwise successful empty
-vector search as a provider failure. `hybrid` means validated vector candidates
-participated in fusion. Lexical infrastructure failures retain the existing 503.
-Vector work is bounded by the embedding timeout plus 15 seconds, with up to four
-canonical lookups at once. The synchronous Gemini adapter runs off the event loop;
-a canceled request can leave its worker finishing until the HTTP timeout.
-
-Retrieval still runs before every generation-cache lookup. Its identity already
-hashes the effective prompt, including evidence text, order, labels and metadata.
-Different hybrid context cannot reuse an old BM25 generation. Identical effective
-generation requests can safely share a cached result across modes; responses use
-current sources and the actual current retrieval mode. No cache-key migration is needed.
-
-Stage 8 supplies offline comparisons before any default change is considered.
-The current 25-clip synthetic corpus supports functional validation only, not quality claims.
-
-### Manual hybrid validation (PowerShell; real Gemini, no Groq)
-
-Use two terminals in the repository root. Keep your existing Gemini key in the
-server terminal's local environment; do not print or paste it into these commands.
-The following requests use Gemini quota. They do not write either index.
-
-Terminal 1 — start a separate evidence-only API (no `--env-file` needed):
-
-```powershell
-if (-not $env:RAG_EMBEDDING_API_KEY) { throw 'Set your existing key locally first; do not print it' }
-$env:RAG_ENABLED = 'true'
-$env:RAG_RETRIEVAL_MODE = 'hybrid'
-$env:RAG_LLM_PROVIDER = ''
-$env:RAG_SOURCE_INDEX = 'podcast_clips'
-$env:RAG_VECTOR_INDEX = 'podcast_rag_v1'
-$env:RAG_EMBEDDING_PROVIDER = 'gemini'
-$env:RAG_EMBEDDING_MODEL = 'gemini-embedding-2'
-$env:RAG_EMBEDDING_DIMENSIONS = '768'
-$env:RAG_EMBEDDING_REVISION = 'v1'
-$env:RAG_EMBEDDING_TIMEOUT_SECONDS = '20'
-.\.venv\Scripts\python.exe -B -m uvicorn api.main:app --host 127.0.0.1 --port 8007
-```
-
-Terminal 2 — record data, then verify hybrid evidence and source resolution:
-
-```powershell
-$es = 'http://localhost:9200'
-$api = 'http://127.0.0.1:8007'
-foreach ($index in @('podcast_clips', 'podcast_rag_v1')) {
-  if ((Invoke-RestMethod "$es/$index/_count").count -ne 25) { throw "Unexpected count: $index" }
-}
-$mapping = Invoke-RestMethod "$es/podcast_rag_v1/_mapping"
-if ($mapping.podcast_rag_v1.mappings.properties.embedding.dims -ne 768) { throw 'Wrong dimension' }
-function Get-CorpusSnapshot {
-  $records = foreach ($index in @('podcast_clips', 'podcast_rag_v1')) {
-    $data = Invoke-RestMethod "$es/$index/_search?size=100&seq_no_primary_term=true"
-    foreach ($item in ($data.hits.hits | Sort-Object _id)) {
-      [ordered]@{ index=$index; id=$item._id; seq=$item._seq_no; term=$item._primary_term; source=$item._source }
-    }
-  }
-  ConvertTo-Json -InputObject @($records) -Depth 30 -Compress
-}
-$before = Get-CorpusSnapshot
-Invoke-RestMethod "$api/health"
-Invoke-RestMethod "$api/search?q=machine%20learning"
-foreach ($question in @('What do the speakers say about machine learning?', 'How is AI used?', 'What challenges are discussed?')) {
-  $body = @{question=$question} | ConvertTo-Json
-  $result = Invoke-RestMethod "$api/ask" -Method Post -ContentType 'application/json' -Body $body
-  $result | Select-Object status, retrieval_mode, reason, degraded
-  if ($result.retrieval_mode -ne 'hybrid' -or $result.sources.Count -eq 0) { throw 'Hybrid evidence not returned' }
-  if ($null -ne $result.answer -or $result.reason -ne 'llm_not_configured') { throw 'Expected evidence-only response' }
-  foreach ($source in $result.sources) {
-    $id = [uri]::EscapeDataString($source.chunk_id)
-    $resolved = Invoke-RestMethod "$api/sources/$id"
-    if ($resolved.chunk_id -ne $source.chunk_id -or $resolved.excerpt -ne $source.excerpt) { throw 'Source mismatch' }
-  }
-}
-if ((Get-CorpusSnapshot) -ne $before) { throw 'Corpus changed' }
-```
-
-For a safe fallback test, stop only this test API with Ctrl+C in Terminal 1,
-point it at a nonexistent name, and restart. This does not create/delete an index
-and fails before contacting Gemini:
-
-```powershell
-$env:RAG_VECTOR_INDEX = 'rag-unavailable-' + [guid]::NewGuid().ToString('N')
-.\.venv\Scripts\python.exe -B -m uvicorn api.main:app --host 127.0.0.1 --port 8007
-```
-
-Terminal 2:
-
-```powershell
-$body = @{question='machine learning'} | ConvertTo-Json
-$fallback = Invoke-RestMethod "$api/ask" -Method Post -ContentType 'application/json' -Body $body
-$fallback | Select-Object status, retrieval_mode, degraded, reason
-if ($fallback.retrieval_mode -ne 'bm25' -or -not $fallback.degraded -or $fallback.sources.Count -eq 0) { throw 'Fallback failed' }
-if ((Get-CorpusSnapshot) -ne $before) { throw 'Corpus changed' }
-```
-
-Stop the test API afterwards. Restore `$env:RAG_VECTOR_INDEX='podcast_rag_v1'` and
-`$env:RAG_RETRIEVAL_MODE='bm25'` in Terminal 1 before your next normal startup.
-No data or volume cleanup is required.
-
-## RAG generation cache (Stage 5)
-
-`RAG_ANSWER_CACHE_TTL_SECONDS=900` enables a 15-minute generation cache using the
-existing Redis connection. Set `0` to disable it; restart the API after changes.
-BM25 retrieval, metadata enrichment, and context selection still run on every
-`/ask`. Only validated structured answers and model abstentions are cached, never
-the complete response or old source metadata. `cached=true` means generation was
-loaded from this cache and revalidated against the current context's source IDs.
-
-Keys use `rag:answer:v1:<sha256>`, separate from the unchanged search cache and its
-TTL. The hash covers the actual system/user prompts (including evidence order),
-provider, model, output limit, timeout, validation schema, and generation version.
-Raw questions, transcripts, and credentials are not placed in keys. The payload
-contains only `status` and `paragraphs`; Redis therefore stores generated text.
-Provider wire-schema/fixed-setting changes must bump `GENERATION_VERSION`.
-
-Failures, invalid outputs, disabled/unconfigured RAG, missing evidence, and context
-budget failures are not cached. Corrupt entries are misses and may be overwritten
-by a valid generation; otherwise they expire. Redis GET/SET errors fail open, with
-a one-second bound per cache operation, and never expose Redis diagnostics.
-Hits do not refresh TTL. Concurrent misses may each generate; there is no locking
-or request coalescing in this stage. Equivalent means identical effective prompts,
-not semantic similarity. API keys are excluded from cache identity, so key rotation
-does not invalidate otherwise identical generation.
-
-## Optional RAG answers (Stage 3)
-
-Set `RAG_ENABLED=true` in the process environment (or use Uvicorn's
-`--env-file .env`) to enable `POST /ask` with `{"question": "..."}`. No LLM or
-embedding credentials are required for default BM25 retrieval. Without generation settings,
-retrieval returns `answer: null`, full passages in `sources`,
-`retrieval_mode: "bm25"`, and `status: "generation_unavailable"` with reason
-`llm_not_configured`. An unsupported provider returns `unsupported_provider`.
-An empty or unusable candidate set returns `insufficient_context`.
-Disabled RAG retains the Stage 1 disabled response and performs no I/O.
-
-For optional live generation, configure only server-side environment variables:
-
-```text
-RAG_ENABLED=true
-RAG_LLM_PROVIDER=groq
-RAG_LLM_MODEL=openai/gpt-oss-20b
-RAG_LLM_API_KEY=
-RAG_CONTEXT_MAX_TOKENS=8000
-RAG_MAX_OUTPUT_TOKENS=1600
-RAG_LLM_TIMEOUT_SECONDS=20
-```
-
-Supply the key privately in your local environment. These are live-validated
-starting values for this project, not universal optimal values. The model is
-selected solely through `RAG_LLM_MODEL`; application logic has no hard-coded model.
-Live validation returned a grounded answer with validated citations using these settings.
-
-No default model or SDK is supplied. The adapter uses the existing async HTTPX
-client and Groq's `POST https://api.groq.com/openai/v1/chat/completions`, with
-`response_format.type=json_schema`, `json_schema.strict=true`, and
-`max_completion_tokens`. Select a model supporting strict Structured Outputs.
-The closed schema requires `status` and `paragraphs`; each paragraph requires
-`text` and `source_ids`. Application validation remains authoritative for citation
-membership and semantic status consistency. See [Groq Structured Outputs](https://console.groq.com/docs/structured-outputs).
-Provider credentials are read only from `RAG_LLM_API_KEY`, never put in prompts,
-serialized config, error messages, or frontend responses. Clients close after each
-request; redirects, ambient HTTP proxies, streaming, and automatic retries are off.
-
-System instructions require evidence-only answers, paragraph-level source IDs,
-abstention when unsupported, and ignoring instructions in transcript text. The
-user message contains JSON-encoded question and `TRANSCRIPT_EVIDENCE` data.
-Successful responses contain `status: "answered"` and
-`answer: {"paragraphs":[{"text":"...","source_ids":["S1"]}]}`. Every paragraph
-must be nonblank and cite supplied evidence; unknown IDs, extra fields, duplicate
-JSON keys, wrong types, malformed JSON, and missing citations reject the entire
-answer as `invalid_generation`. No regex or Markdown citation extraction is used.
-Citation validation verifies source membership, not semantic entailment.
-
-`RAG_CONTEXT_MAX_TOKENS` defaults to 8,000, including instructions, question,
-JSON source labels/metadata, evidence, a 256-token framing margin, and reserved
-output (`RAG_MAX_OUTPUT_TOKENS`: documented starting value 1600; code fallback 800
-when absent). One UTF-8 byte counts as one estimated
-token. This intentionally conservative approximation is isolated in `prompt.py`;
-it cannot guarantee the limits of every model/tokenizer. Choose a total budget
-within the selected model's context window. Whole passages that do not fit are
-omitted from the model request, never truncated; returned sources remain intact.
-Citations are checked against the subset actually sent, not all retrieved sources.
-No fitting evidence returns `insufficient_context` / `context_budget_exceeded`
-without calling the provider. Model abstention returns `model_abstained`.
-
-Timeouts (`RAG_LLM_TIMEOUT_SECONDS`, default 20), authentication errors, rate/quota
-limits, provider 5xx/network failures and rejected requests return safe reason
-codes with `generation_unavailable`, `answer: null`, retained sources, and
-`degraded: true`. Invalid generation also retains sources and is degraded. No LLM
-configuration or network failure affects startup, `/search`, `/health`, or sources.
-No real Groq validation is part of automated tests; live validation is separate.
-Safe server-side `Groq provider error:` diagnostics retain only sanitized error
-fields and request facts (model, format, output limit, message byte lengths, and
-source count). Only `json_validate_failed` includes a sanitized `failed_generation`,
-bounded to 2000 characters with escaped line breaks; credential-like content is
-redacted. Diagnostics never dump request headers or complete provider bodies and
-are not exposed through `/ask`.
-
-The RAG path reuses the lexical query builder but reads `_source.clip_text`, never
-search highlights. It requests 30 candidates by default, ranks by BM25 score with
-stable provenance tie-breaks, deduplicates identical source identities, and skips
-clips overlapping at least 45% of the shorter selected clip in the same episode.
-It selects at most 6 sources with a combined 16,000 UTF-8 bytes of transcript text.
-This is a conservative token proxy, not a model token guarantee or a total HTTP
-response-size limit. Oversized clips are skipped, not truncated. Candidate,
-source, and byte limits are configurable in `.env.example`. A bounded candidate
-window may underfill the source list when repeated imports dominate results.
-
-`chunk_id` is `v1.` followed by unpadded base64url of compact UTF-8 JSON containing
-`[podcast_id, episode_id, start_ms, end_ms, sha256(exact_clip_text)]`. The content
-hash preserves whitespace; Elasticsearch document IDs and clip indexes are not
-identity inputs. Thus identical reimports collapse without modifying legacy data.
-`source_id` (`S1`, `S2`, ...) is only a response-local display label.
-
-`GET /sources/{chunk_id}` searches only the server's `RAG_SOURCE_INDEX` and checks
-the content hash before returning exact text and current PostgreSQL metadata.
-It needs no in-memory registry and survives API restarts. Invalid, unknown, stale,
-or disabled sources return 404. Elasticsearch errors/partial results return 503.
-Resolution checks up to 1,000 matching time-range records before returning 503
-rather than falsely reporting not-found. Missing or unavailable metadata retains
-identifiers/timestamps with unknown display names and `metadata_available=false`.
-Evidence responses flag `degraded=true` when metadata is unavailable.
-
-Run unit tests with `python -m pytest` (or explicit `ingest/tests api/tests`).
-`pytest.ini` restricts discovery to test directories, excluding the legacy CLI
-`scripts/integration_test.py`, whose separate `requests` dependency is undeclared.
-Generation tests use a deterministic fake provider or HTTPX MockTransport, clear
-ambient LLM settings, and prohibit real HTTPX network transports. To also run the
-isolated real-service test in PowerShell:
-
-```powershell
-$env:RAG_INTEGRATION_TESTS = "1"
-.\.venv\Scripts\python.exe -m pytest api/tests/test_rag_integration.py -v
-```
-
-The integration tests exercise evidence-only and fake-generation modes; they
-create/delete unique Elasticsearch indexes and roll back PostgreSQL metadata
-transactions. Existing `/search`, Redis caching, ingestion,
-database schemas, and frontend behavior are unchanged.
-
-A full-stack search engine over the [Spotify Podcast Dataset](https://podcastsdataset.byspotify.com/) that lets users find clips from podcast episodes matching a free-text query. Results display ranked clip cards with highlighted transcript excerpts and speaker attribution.
+- **Search and Ask:** keyword search stays independent from optional question answering.
+- **Traceable evidence:** paragraph citations link to episode metadata, timestamp ranges and full source passages.
+- **Optional hybrid retrieval:** BM25 + 768-dimensional Gemini vectors, fused with Reciprocal Rank Fusion (RRF); BM25 remains the default and fallback.
+- **Failure-aware generation:** strict structured output, application citation checks, abstention and generation-only Redis caching.
+- **Bounded data preparation:** stream a small Spotify archive sample, preserve compliance identifiers, and rerun ingestion/backfill safely.
+- **Measured trade-off:** on 20 real-data queries, Hit@5 increased from **0.75 to 0.90**, while mean retrieval latency increased from **37.6 ms to 744.0 ms**.
 
 ## Architecture
 
+The diagram shows the Ask path. The separate `/search` path returns lexical search results without embedding or LLM calls.
+
+```mermaid
+flowchart TD
+    User --> UI[React / TypeScript]
+    UI --> API[FastAPI /ask]
+    API --> BM[Elasticsearch BM25]
+    API -. hybrid only .-> QE[Gemini query embedding]
+    QE --> KN[Elasticsearch vector kNN]
+    BM -. hybrid .-> RRF[Reciprocal Rank Fusion]
+    KN --> RRF
+    BM -->|default BM25| Context[Dedupe, overlap suppression, bounded context]
+    RRF --> Context
+    PG[PostgreSQL metadata] --> Context
+    Context --> Cache[Redis generation cache]
+    Cache -->|miss| LLM[Groq structured generation]
+    Cache -->|hit| Check[Structure and citation validation]
+    LLM --> Check
+    Check --> Answer[Cited answer and current sources]
+    Answer --> UI
 ```
-┌──────────┐     ┌──────────────┐     ┌───────────────┐
-│  React   │────▶│   FastAPI    │────▶│ Elasticsearch │
-│ Frontend │     │   /search    │     │  (clip index) │
-└──────────┘     │   /health    │     └───────────────┘
-                 │              │────▶┌───────────────┐
-                 │              │     │  PostgreSQL    │
-                 │              │     │  (metadata)    │
-                 │              │     └───────────────┘
-                 │              │────▶┌───────────────┐
-                 │              │     │    Redis       │
-                 └──────────────┘     │   (cache)      │
-                                      └───────────────┘
 
-┌──────────────────────────────────────────────────────┐
-│              Ingest Pipeline (CLI)                    │
-│  Transcript JSON ──▶ Parser ──▶ Segmenter ──▶ ES     │
-│  metadata.tsv    ──▶ Metadata Loader ──▶ Postgres    │
-└──────────────────────────────────────────────────────┘
-```
+Source transcripts and vectors live in separate Elasticsearch indexes. Vector hits must resolve back to matching canonical source text before they become evidence. [Architecture details](documentation/architecture.md).
 
-**Ingest pipeline** parses Spotify transcript JSONs into overlapping 2-minute clips (with 1-minute overlap), indexes them into Elasticsearch with the English analyzer and fuzzy matching.
+## How Retrieval Works
 
-**Search API** (FastAPI) queries ES, enriches results with show/episode metadata from Postgres, and caches responses in Redis (1-hour TTL).
+1. **Lexical retrieval:** BM25 matches questions against transcript text, with fuzzy matching for spelling variations. RAG reads full passages, not search highlights.
+2. **Optional semantic retrieval:** Hybrid embeds the question with `gemini-embedding-2` at 768 dimensions, then searches a compatible vector index.
+3. **Rank fusion:** RRF combines the ranked lists by stable chunk identity. A passage found by both receives contributions from both; deterministic tie-breaking applies to fixed rankings.
+4. **Context selection:** exact duplicates and heavily overlapping clips are suppressed, then source-count and evidence-size limits are applied.
+5. **Fallback:** unavailable embeddings or vector infrastructure leave BM25 evidence available. The response reports the actual retrieval mode.
 
-**Frontend** (React + TypeScript + Tailwind) displays clip cards with highlighted excerpts, speaker badges, timestamp ranges, and a "Load more" button for pagination.
+Defaults are 30 lexical and 30 vector candidates, RRF `k=60`, and at most six selected sources totaling 16,000 UTF-8 bytes of transcript. The server controls retrieval mode; the UI does not select providers or models.
+
+## Grounded QA
+
+Groq receives bounded evidence with source labels, metadata and timestamps. Instructions require evidence-only answers, citations for every substantive paragraph, and abstention when evidence is insufficient; transcript instructions are treated as untrusted data.
+
+The adapter requests strict JSON Schema output. Python then rejects malformed answers, blank paragraphs, inconsistent status, missing citations and IDs outside the context actually supplied. This validates citation membership, **not semantic entailment**.
+
+The UI renders paragraphs and citation links to source cards. If generation fails, retrieved sources remain visible. Redis caches validated generation for 15 minutes by default, but **retrieval runs on every request**, and cached output is revalidated against current evidence. Redis failures do not prevent fresh RAG generation.
+
+## Real-Data Evaluation
+
+The completed local evaluation used **20 real podcast episodes**, **730 transcript chunks** from 120-second windows with 60-second overlap, and **730 Gemini embedding-2 document vectors**. Both modes used the same fixed corpus and **20 AI-assisted, human-reviewed and approved queries/judgments**.
+
+| Metric | BM25 | Hybrid |
+|---|---:|---:|
+| Hit@1 | 0.6000 | 0.7000 |
+| Recall@1 | 0.2917 | 0.3417 |
+| Hit@3 | 0.6500 | 0.8500 |
+| Recall@3 | 0.3167 | 0.4333 |
+| Hit@5 | 0.7500 | 0.9000 |
+| Recall@5 | 0.3667 | 0.4500 |
+| MRR | 0.6417 | 0.7875 |
+| Binary nDCG@5 | 0.4024 | 0.5019 |
+| Mean retrieval latency (ms) | 37.6000 | 744.0200 |
+| Median retrieval latency (ms) | 36.8184 | 740.8537 |
+| Retrieval errors | 0 | 0 |
+
+Hybrid succeeded for 20/20 queries, with zero BM25 fallbacks, vector failures or no-usable-vector cases.
+
+**On this small real-data evaluation set, Hybrid retrieval improved retrieval-quality metrics at the cost of substantially higher latency.** Hit@3 improved by 0.20 and Hit@5 by 0.15; MRR increased from 0.6417 to 0.7875 and nDCG@5 from 0.4024 to 0.5019. Hybrid adds query embedding, vector lookup and source hydration work. These are retrieval timings, not end-to-end answer generation latency.
+
+This is a small-scale evaluation, not a large benchmark or evidence of universal superiority. BM25 remains the default. [Methodology, fingerprint and limitations](documentation/evaluation.md).
 
 ## Tech Stack
 
-| Component | Technology |
-|-----------|-----------|
-| Search index | Elasticsearch 8.13 |
-| Metadata store | PostgreSQL 16 |
-| Cache | Redis 7 |
-| Backend | Python 3.12, FastAPI |
-| Frontend | React 18, TypeScript, Vite, Tailwind CSS |
-| Ingest | Python, concurrent.futures for parallelism |
+| Layer | Implementation |
+|---|---|
+| Frontend | React 19, TypeScript, Vite 8, Tailwind CSS |
+| Backend | Python 3.12, FastAPI, Pydantic, HTTPX |
+| Retrieval | Elasticsearch 8.13.0 BM25 and dense-vector kNN; application-side RRF |
+| Embeddings / generation | Gemini `gemini-embedding-2` (768 dimensions) / Groq |
+| Infrastructure | PostgreSQL 16, Redis 7, Docker Compose |
+| Validation | pytest, mocked providers, opt-in Docker integrations, Vitest / Testing Library |
 
 ## Quick Start
 
-### Prerequisites
+Use Python 3.12, Node.js 24 and Docker Compose. Commands below use PowerShell from the repository root; on other shells use equivalent virtual-environment paths.
 
-- Docker & Docker Compose
-- Python 3.12+
-- Node.js 18+
-
-### 1. Start infrastructure
-
-```bash
-cp .env.example .env
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r ingest/requirements.txt -r api/requirements.txt
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 docker compose up -d
 ```
 
-This starts Elasticsearch (port 9200), PostgreSQL (port 5432), and Redis (port 6379).
+Wait for Elasticsearch, PostgreSQL and Redis to be ready. On a **fresh local installation**, create a small synthetic corpus; the real dataset is not required:
 
-### 2. Install Python dependencies
-
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -r ingest/requirements.txt
-pip install -r api/requirements.txt
+```powershell
+.\.venv\Scripts\python.exe -c "from scripts.sample_data import generate_fixtures; generate_fixtures('.local-eval/synthetic', count=5)"
+.\.venv\Scripts\python.exe -m ingest.ingest --transcripts-dir .local-eval/synthetic/transcripts --metadata-tsv .local-eval/synthetic/metadata.tsv --workers 2
 ```
 
-### 3. Extract transcripts
+Run that legacy seed once: generated Elasticsearch IDs can duplicate documents on repeated imports. Skip it when preserving an existing corpus. It uses process environment variables, not automatic `.env` loading.
 
-The dataset ships as tar.gz archives. Extract at least one:
+Start an evidence-enabled API, then the frontend in another terminal:
 
-```bash
-cd podcasts-no-audio-13GB
-tar -xzf podcasts-transcripts-0to2.tar.gz
+```powershell
+$env:RAG_ENABLED = 'true'
+$env:RAG_RETRIEVAL_MODE = 'bm25'
+.\.venv\Scripts\python.exe -m uvicorn api.main:app --env-file .env --host 127.0.0.1 --port 8000
 ```
 
-This creates `spotify-podcasts-2020/podcasts-transcripts/` with JSON files organized by `{0-7}/{A-Z}/show_{id}/{episode_id}.json`.
-
-### 4. Run the ingest pipeline
-
-```bash
-python -m ingest.ingest \
-  --transcripts-dir podcasts-no-audio-13GB/spotify-podcasts-2020/podcasts-transcripts \
-  --metadata-tsv podcasts-no-audio-13GB/metadata.tsv \
-  --clip-duration 120 \
-  --overlap 60 \
-  --workers 2
-```
-
-This parses transcripts, segments them into overlapping clips, loads metadata into Postgres, and bulk-indexes clips into Elasticsearch.
-
-### 5. Start the API
-
-```bash
-uvicorn api.main:app --port 8000
-```
-
-Endpoints:
-- `GET /search?q=machine+learning&from=0&size=10` — search clips
-- `GET /health` — health check
-
-### 6. Start the frontend
-
-```bash
+```powershell
 cd ui
-npm install
+npm ci
 npm run dev
 ```
 
-Open http://localhost:5173 in your browser. The Vite dev server proxies `/search` and `/health` to the API on port 8000.
+Open the Vite URL (normally `http://localhost:5173`). Without LLM configuration, Ask returns evidence with `answer: null`. Set generation credentials privately in the server environment or ignored `.env`:
 
-## Project Structure
+| Settings | Purpose |
+|---|---|
+| `ES_HOST`, `POSTGRES_DSN`, `REDIS_URL` | Service connections; defaults target local Compose services. Keep PostgreSQL settings consistent with Compose. |
+| `RAG_ENABLED=true`, `RAG_RETRIEVAL_MODE=bm25` | Enable Ask while retaining default lexical retrieval. |
+| `RAG_LLM_PROVIDER=groq`, `RAG_LLM_MODEL` | Select Groq and a model supporting strict Structured Outputs. |
+| `RAG_LLM_API_KEY` | Server-only generation credential; never use a `VITE_*` secret. |
+| `RAG_SOURCE_INDEX` | Ask/evaluation source index; defaults to `podcast_clips`. |
 
-```
-podcast-search/
-├── docker-compose.yml          # ES, Postgres, Redis
-├── .env.example                # Environment variables template
-├── init.sql                    # Postgres schema (shows, episodes)
-├── ingest/
-│   ├── parser.py               # Transcript JSON → WordRecord list
-│   ├── segmenter.py            # WordRecord list → overlapping Clips
-│   ├── es_client.py            # ES index creation + bulk indexing
-│   ├── metadata_loader.py      # metadata.tsv → Postgres
-│   ├── ingest.py               # CLI entry point (parallel processing)
-│   └── tests/                  # 23 unit tests
-├── api/
-│   ├── models.py               # Pydantic request/response schemas
-│   ├── search.py               # ES query builder + result assembler
-│   ├── cache.py                # Redis async cache wrapper
-│   ├── db.py                   # Postgres async queries
-│   ├── main.py                 # FastAPI app
-│   └── tests/                  # 19 unit tests
-├── ui/
-│   ├── src/
-│   │   ├── App.tsx             # Main app with search state
-│   │   ├── components/
-│   │   │   ├── SearchBar.tsx   # Search input + duration selector
-│   │   │   ├── ClipCard.tsx    # Result card with highlights
-│   │   │   ├── ResultsList.tsx # Results list with load more
-│   │   │   └── DurationSelector.tsx
-│   │   ├── api/client.ts       # Fetch wrapper for /search
-│   │   └── types.ts            # TypeScript interfaces
-│   └── tests/                  # 17 component tests
-└── scripts/
-    ├── sample_data.py          # Generate synthetic test fixtures
-    └── integration_test.py     # End-to-end test
+Previously validated starting settings are `openai/gpt-oss-20b`, an 8000-token estimated context budget, 1600 output tokens and a 20-second timeout. These are configuration choices, not universal optima. See [.env.example](.env.example) and [operational configuration](documentation/development-notes.md#configuration-and-local-startup) for code defaults and optional Gemini setup.
+
+## API
+
+| Endpoint | Behavior |
+|---|---|
+| `GET /search?q=...&from=0&size=10` | Searches `podcast_clips`; returns `query`, `total`, `clips` and `took_ms`, with highlighted excerpts and metadata. `size` is capped at 100. |
+| `POST /ask` | Accepts `{"question":"..."}`; trims and validates 1–2000 characters. Returns status, optional answer paragraphs, sources, actual retrieval mode, `degraded`, `cached`, reason and timing. |
+| `GET /sources/{chunk_id}` | Resolves exact evidence and current metadata from `RAG_SOURCE_INDEX`; unknown/stale sources return 404, unavailable retrieval returns 503. |
+| `GET /health` | Returns `{"status":"ok"}`; a liveness response, not a dependency-readiness check. |
+
+Ask statuses are `answered`, `insufficient_context`, `generation_unavailable`, `invalid_generation` and `disabled`. Retrieval infrastructure errors return HTTP 503; invalid input returns 422. Successful answers contain `answer.paragraphs`, each with `text` and `source_ids`. RAG settings do not change `/search`; its legacy `clip_minutes` parameter is accepted but does not currently alter retrieval windows.
+
+## Evaluation CLI
+
+With a locally reviewed dataset and matching source/vector configuration:
+
+```powershell
+.\.venv\Scripts\python.exe -m api.rag.evaluate --dataset .local-eval/queries.jsonl --mode both --output .local-eval/comparison.json
 ```
 
-## Running Tests
+Use `--mode bm25` for a provider-free lexical run. Hybrid evaluation uses Gemini, never Groq. Reports and judgments remain local; the repository includes only a tiny synthetic test fixture. [Evaluation format and reproduction guidance](documentation/evaluation.md#reproduction).
 
-```bash
-# Backend tests (42 tests)
-source .venv/bin/activate
-python -m pytest ingest/tests/ api/tests/ -v
+## Testing
 
-# Frontend tests (17 tests)
-cd ui && npx vitest run
-
-# Integration test (requires docker-compose services running)
-python scripts/integration_test.py
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+# Opt in to isolated Docker-backed tests:
+$env:RAG_INTEGRATION_TESTS = '1'
+.\.venv\Scripts\python.exe -m pytest
+Remove-Item Env:RAG_INTEGRATION_TESTS
 ```
 
-## Key Design Decisions
+From `ui/`, run `npm test` and `npm run build`. Provider tests use fakes or mocked HTTP, not real Gemini/Groq requests. Integration tests use temporary indexes and isolated database data. [Coverage and operational checks](documentation/development-notes.md#validation).
 
-- **50% clip overlap** — clips overlap by half their duration so relevant passages near boundaries are always fully captured in at least one clip
-- **Fuzzy matching (`fuzziness: AUTO`)** — compensates for the ~18% ASR word error rate in the transcripts
-- **`word_timestamps` stored but not indexed** (`"enabled": false`) — keeps the ES index lean; timestamps are only used by the frontend for potential audio seek
-- **Metadata enriched at query time** — joining against Postgres at search time means metadata updates don't require re-indexing
-- **All time values in milliseconds (integers)** — avoids floating-point formatting inconsistencies across the stack
+## Demo
 
-## Environment Variables
+Screenshots of the Search and Ask interfaces can be added here. No screenshots are currently included.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ES_HOST` | `http://localhost:9200` | Elasticsearch URL |
-| `ES_INDEX` | `podcast_clips` | ES index name |
-| `POSTGRES_USER` | `podcast` | Postgres user |
-| `POSTGRES_PASSWORD` | `podcast` | Postgres password |
-| `POSTGRES_DB` | `podcasts` | Postgres database |
-| `POSTGRES_DSN` | `postgresql://podcast:podcast@localhost:5432/podcasts` | Full DSN |
-| `REDIS_URL` | `redis://localhost:6379/0` | Redis URL |
-| `CLIP_DURATION_DEFAULT` | `120` | Default clip duration (seconds) |
-| `CLIP_OVERLAP` | `60` | Clip overlap (seconds) |
-| `API_PORT` | `8000` | API server port |
+## Limitations
 
-## Dataset
+- Twenty reviewed queries and one small corpus do not establish broad retrieval quality or statistical significance.
+- Hybrid adds network latency, provider cost and rate-limit exposure; Groq availability also affects generation.
+- Valid citations do not prove factual entailment. ASR errors and chunk boundaries can affect evidence quality.
+- Context budgeting uses a conservative byte-based approximation, not an exact model tokenizer.
+- This is a local application, without production authentication, streaming answers or conversation history.
 
-This project uses the [Spotify Podcasts Dataset](https://podcastsdataset.byspotify.com/) (~105K episodes). The dataset includes:
+## Dataset and Privacy
 
-- **Transcripts** — Google Speech-to-Text ASR output in JSON format, with word-level timestamps and speaker diarization
-- **Metadata** — TSV with show/episode names, descriptions, publishers, durations, and RSS links
+Spotify Podcasts 2020 dataset files are **not distributed in this repository**. Keep real transcripts, metadata, embeddings, judgments and evaluation artifacts local and out of Git; publish only permitted aggregate results. The sample importer retains show/episode filename prefixes for later compliance and retraction handling, but does not automate that process. Follow the dataset's access and usage requirements.
+
+Keep API keys server-side in the local environment or ignored `.env`, never in source control, browser configuration or documentation. Selected transcript context is sent to Groq for live generation; document text is sent to Gemini during backfill and questions during Hybrid retrieval. Local retention does not mean provider-free processing.
+
+[Architecture](documentation/architecture.md) · [Evaluation](documentation/evaluation.md) · [Development and operations](documentation/development-notes.md)
